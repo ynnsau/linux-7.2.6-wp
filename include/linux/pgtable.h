@@ -16,6 +16,9 @@
 #include <linux/errno.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
+#ifdef CONFIG_CMDP
+#include <linux/cmdp_pte.h>
+#endif
 
 #if 5 - defined(__PAGETABLE_P4D_FOLDED) - defined(__PAGETABLE_PUD_FOLDED) - \
 	defined(__PAGETABLE_PMD_FOLDED) != CONFIG_PGTABLE_LEVELS
@@ -444,6 +447,22 @@ static inline pte_t pte_advance_pfn(pte_t pte, unsigned long nr)
 static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
 		pte_t *ptep, pte_t pte, unsigned int nr)
 {
+#ifdef CONFIG_CMDP
+	if (unlikely(cmdp_ptes_need_write_protect(pte, nr))) {
+		for (;;) {
+			pte_t next = pte;
+
+			pte = cmdp_preserve_write_protect(pte);
+			page_table_check_ptes_set(mm, addr, ptep, pte, 1);
+			set_pte(ptep, pte);
+			if (--nr == 0)
+				return;
+			addr += PAGE_SIZE;
+			ptep++;
+			pte = pte_next_pfn(next);
+		}
+	}
+#endif
 	page_table_check_ptes_set(mm, addr, ptep, pte, nr);
 
 	for (;;) {

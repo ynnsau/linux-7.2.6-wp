@@ -69,6 +69,7 @@
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/cmdp.h>
 #include <linux/dax.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
@@ -4219,6 +4220,30 @@ static bool wp_can_reuse_anon_folio(struct folio *folio,
 	return true;
 }
 
+#ifdef CONFIG_CMDP
+static vm_fault_t wp_page_cmdp(struct vm_fault *vmf)
+	__releases(vmf->ptl)
+{
+	struct cmdp_entry *entry;
+	int ret = 0;
+
+	/* PTL stabilizes the mapping; lookup takes an independent entry ref. */
+	get_page(vmf->page);
+	entry = cmdp_lookup(vmf->page);
+	put_page(vmf->page);
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	if (IS_ERR(entry))
+		return VM_FAULT_SIGBUS;
+	if (entry) {
+		ret = cmdp_prepare_write(entry);
+		cmdp_put(entry);
+	}
+
+	/* Keep Linux's COW/reuse decisions on refault, with no extra page ref. */
+	return ret ? VM_FAULT_SIGBUS : 0;
+}
+#endif
+
 /*
  * This routine handles present pages, when
  * * users try to write to a shared page (FAULT_FLAG_WRITE)
@@ -4284,6 +4309,12 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 
 	if (vmf->page)
 		folio = page_folio(vmf->page);
+
+#ifdef CONFIG_CMDP
+	if ((vmf->flags & FAULT_FLAG_WRITE) && vmf->page &&
+	    PageCmdp(vmf->page))
+		return wp_page_cmdp(vmf);
+#endif
 
 	/*
 	 * Shared mapping: we are guaranteed to have VM_WRITE and

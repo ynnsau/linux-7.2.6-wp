@@ -8,6 +8,7 @@
  *	(C) Copyright 2002 Red Hat Inc, All Rights Reserved
  */
 
+#include <linux/cmdp.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
 #include <linux/hugetlb.h>
@@ -1992,6 +1993,11 @@ static unsigned long do_mremap(struct vma_remap_struct *vrm)
 	if (mmap_write_lock_killable(mm))
 		return -EINTR;
 	vrm->mmap_locked = true;
+
+	if (cmdp_mm_active(mm)) {
+		res = -EBUSY;
+		goto out;
+	}
 
 	if (!check_map_count_against_split_early()) {
 		mmap_write_unlock(mm);

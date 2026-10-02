@@ -381,7 +381,12 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 			  unsigned long address, pte_t *ptep,
 			  pte_t entry, int dirty)
 {
-	int changed = !pte_same(*ptep, entry);
+	int changed;
+
+#ifdef CONFIG_CMDP
+	entry = cmdp_preserve_write_protect(entry);
+#endif
+	changed = !pte_same(*ptep, entry);
 
 	if (changed && dirty)
 		set_pte(ptep, entry);

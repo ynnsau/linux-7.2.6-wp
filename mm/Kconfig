@@ -1511,4 +1511,22 @@ config LAZY_MMU_MODE_KUNIT_TEST
 
 source "mm/damon/Kconfig"
 
+config CMDP
+	bool "Restricted CMD-P physical-page write protection experiment"
+	depends on X86_64 && MMU && DEBUG_FS && !XEN_PV
+	select MMU_NOTIFIER
+	help
+	  Experimental, privileged, single-mm manager for private anonymous
+	  order-0 pages. Hardware operations are dummy completions. Fork,
+	  mprotect and mremap are rejected while entries exist. UFFD, KSM,
+	  THP, device migration and arbitrary kernel writers are unsupported.
+	  This is not a general-purpose DMA or memory-protection interface.
+
+config CMDP_TEST
+	bool "CMD-P fault injection and pin fixtures"
+	depends on CMDP && DEBUG_KERNEL
+	help
+	  Add privileged debugfs test commands for held GUP references/pins,
+	  protection failure, delayed revoke and stale hardware completions.
+
 endmenu

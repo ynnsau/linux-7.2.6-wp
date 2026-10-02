@@ -9,6 +9,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/cmdp.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/backing-dev.h>
@@ -1738,6 +1739,10 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 
 	if (mmap_write_lock_killable(oldmm))
 		return -EINTR;
+	if (cmdp_mm_active(oldmm)) {
+		mmap_write_unlock(oldmm);
+		return -EBUSY;
+	}
 	flush_cache_dup_mm(oldmm);
 	uprobe_dup_mmap(oldmm, mm);
 	/*

@@ -127,6 +127,10 @@ enum pageflags {
 #ifdef CONFIG_ARCH_USES_PG_ARCH_3
 	PG_arch_3,
 #endif
+#ifdef CONFIG_CMDP
+	/* CMD-P manages this physical page; consult the CMD-P registry. */
+	PG_cmdp,
+#endif
 	__NR_PAGEFLAGS,
 
 	PG_readahead = PG_reclaim,
@@ -569,6 +573,10 @@ PAGEFLAG(XenRemapped, xen_remapped, PF_NO_COMPOUND)
 PAGEFLAG(Reserved, reserved, PF_NO_COMPOUND)
 	__CLEARPAGEFLAG(Reserved, reserved, PF_NO_COMPOUND)
 	__SETPAGEFLAG(Reserved, reserved, PF_NO_COMPOUND)
+
+#ifdef CONFIG_CMDP
+PAGEFLAG(Cmdp, cmdp, PF_NO_COMPOUND)
+#endif
 FOLIO_FLAG(swapbacked, FOLIO_HEAD_PAGE)
 	__FOLIO_CLEAR_FLAG(swapbacked, FOLIO_HEAD_PAGE)
 	__FOLIO_SET_FLAG(swapbacked, FOLIO_HEAD_PAGE)

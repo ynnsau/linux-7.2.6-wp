@@ -9,6 +9,7 @@
  *  (C) Copyright 2002 Red Hat Inc, All Rights Reserved
  */
 
+#include <linux/cmdp.h>
 #include <linux/pagewalk.h>
 #include <linux/hugetlb.h>
 #include <linux/shm.h>
@@ -866,6 +867,11 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 
 	if (mmap_write_lock_killable(current->mm))
 		return -EINTR;
+
+	if (cmdp_mm_active(current->mm)) {
+		error = -EBUSY;
+		goto out;
+	}
 
 	/*
 	 * If userspace did not allocate the pkey, do not let

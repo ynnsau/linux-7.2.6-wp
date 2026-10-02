@@ -9,6 +9,7 @@ TARGETS += cachestat
 TARGETS += capabilities
 TARGETS += cgroup
 TARGETS += clone3
+TARGETS += cmdp
 TARGETS += connector
 TARGETS += core
 TARGETS += cpufreq
