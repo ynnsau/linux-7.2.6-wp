@@ -16,16 +16,20 @@
 #include <sys/reboot.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <linux/cmdp.h>
 #include "../kselftest.h"
 
+#define DEVICE "/dev/cmdp"
 #define CONTROL "/sys/kernel/debug/cmdp/control"
 #define STATS "/sys/kernel/debug/cmdp/stats"
 #define PAGE 4096
 
 static int control = -1;
+static int cmdp_fd = -1;
 
 static void require(bool ok, const char *what)
 {
@@ -40,6 +44,13 @@ static int command(const char *op, unsigned long value)
 	ssize_t ret = write(control, buf, len);
 
 	return ret == len ? 0 : -1;
+}
+
+static int cmdp_request(bool arm, unsigned long addr)
+{
+	struct cmdp_page_req req = { .addr = addr, .flags = 0 };
+
+	return ioctl(cmdp_fd, arm ? CMDP_IOC_ARM : CMDP_IOC_REVOKE, &req);
 }
 
 static uint64_t stat_value(const char *key)
@@ -129,7 +140,7 @@ static void concurrent_writers(volatile unsigned char *p)
 		args[i] = (struct writer) { .barrier = &barrier, .p = p + i };
 		require(!pthread_create(&threads[i], NULL, write_page, &args[i]), "pthread_create");
 	}
-	require(command("arm", (uintptr_t)p) == 0, "arm concurrent writers");
+	require(cmdp_request(true, (uintptr_t)p) == 0, "arm concurrent writers");
 	pthread_barrier_wait(&barrier);
 	for (i = 0; i < 2; i++)
 		require(!pthread_join(threads[i], NULL), "pthread_join");
@@ -162,15 +173,15 @@ static void exit_cleanup(void)
 		volatile unsigned char *p = new_page();
 
 		close(sv[0]);
-		control = open(CONTROL, O_WRONLY);
-		if (control < 0 || command("arm", (uintptr_t)p))
+		cmdp_fd = open(DEVICE, O_RDWR);
+		if (cmdp_fd < 0 || cmdp_request(true, (uintptr_t)p))
 			_exit(1);
 		memset(ancillary, 0, sizeof(ancillary));
 		cmsg = CMSG_FIRSTHDR(&msg);
 		cmsg->cmsg_level = SOL_SOCKET;
 		cmsg->cmsg_type = SCM_RIGHTS;
 		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-		memcpy(CMSG_DATA(cmsg), &control, sizeof(control));
+		memcpy(CMSG_DATA(cmsg), &cmdp_fd, sizeof(cmdp_fd));
 		if (sendmsg(sv[1], &msg, 0) != 1)
 			_exit(2);
 		/* Parent acknowledges the fd transfer before this mm exits. */
@@ -201,19 +212,49 @@ static int run_tests(void)
 	ksft_print_header();
 	if (geteuid() || sysconf(_SC_PAGESIZE) != PAGE)
 		ksft_exit_skip("requires root and 4 KiB pages\n");
+	cmdp_fd = open(DEVICE, O_RDWR);
+	if (cmdp_fd < 0)
+		ksft_exit_skip("/dev/cmdp unavailable: %s\n", strerror(errno));
 	control = open(CONTROL, O_WRONLY);
-	if (control < 0)
+	if (control < 0) {
+		close(cmdp_fd);
 		ksft_exit_skip("CONFIG_CMDP control unavailable: %s\n", strerror(errno));
+	}
 	if (command("test_delay_ms", 0)) {
 		close(control);
 		ksft_exit_skip("CONFIG_CMDP_TEST required\n");
 	}
-	ksft_set_plan(11);
+	ksft_set_plan(14);
+	{
+		pid_t child = fork();
+		int status;
+
+		require(child >= 0, "fork for foreign-mm ioctl check");
+		if (!child) {
+			struct cmdp_page_req req = { .addr = 0, .flags = 0 };
+			int fd;
+			bool ioctl_rejected, open_rejected;
+
+			errno = 0;
+			ioctl_rejected = ioctl(cmdp_fd, CMDP_IOC_ARM, &req) == -1 &&
+				errno == EPERM;
+			errno = 0;
+			fd = open(DEVICE, O_RDWR);
+			open_rejected = fd == -1 && errno == EBUSY;
+			if (fd >= 0)
+				close(fd);
+			_exit(ioctl_rejected && open_rejected ? 0 : 1);
+		}
+		require(waitpid(child, &status, 0) == child,
+			"wait for foreign-mm ioctl check");
+		ksft_test_result(WIFEXITED(status) && !WEXITSTATUS(status),
+				 "session rejects foreign-mm ioctl and open\n");
+	}
 	p = new_page();
 	pfn = page_pfn((void *)p);
 	revokes = stat_value("revokes");
 	t0 = now_ns();
-	require(command("arm", (uintptr_t)p) == 0, "arm pre-touched page");
+	require(cmdp_request(true, (uintptr_t)p) == 0, "arm pre-touched page");
 	arm_ns = now_ns() - t0;
 	ksft_test_result(*p == 0x42 && stat_value("managed") == 1 &&
 			 stat_value("revokes") == revokes, "arm and read without revoke\n");
@@ -225,6 +266,26 @@ static int run_tests(void)
 			 "first write revokes once, completes, preserves PFN\n");
 	ksft_print_msg("application arm=%" PRIu64 " ns first-write=%" PRIu64 " ns\n",
 		       arm_ns, write_ns);
+	revokes = stat_value("revokes");
+	require(cmdp_request(true, (uintptr_t)p) == 0, "arm for explicit revoke ioctl");
+	require(cmdp_request(false, (uintptr_t)p) == 0, "explicit revoke ioctl");
+	ksft_test_result(stat_value("revokes") == revokes + 1 && balanced(),
+			 "ioctl revoke drains and releases ownership\n");
+	{
+		struct cmdp_page_req invalid = {
+			.addr = (uintptr_t)p + 1,
+			.flags = 0,
+		};
+		bool rejected = ioctl(cmdp_fd, CMDP_IOC_ARM, &invalid) == -1 &&
+			errno == EINVAL;
+
+		invalid.addr = (uintptr_t)p;
+		invalid.flags = 1;
+		errno = 0;
+		rejected &= ioctl(cmdp_fd, CMDP_IOC_ARM, &invalid) == -1 &&
+			errno == EINVAL;
+		ksft_test_result(rejected, "ioctl rejects unaligned address and flags\n");
+	}
 	concurrent_writers(p);
 
 	for (i = 0; i < 2; i++) {
@@ -232,7 +293,7 @@ static int run_tests(void)
 		require(command(i ? "test_get" : "test_pin", (uintptr_t)p) == 0, "hold fixture");
 		publishes = stat_value("publishes");
 		errno = 0;
-		ret = command("arm", (uintptr_t)p);
+		ret = cmdp_request(true, (uintptr_t)p);
 		ksft_test_result(ret == -1 && errno == EBUSY &&
 				 stat_value("publishes") == publishes && balanced(),
 				 "reject existing %s\n", i ? "GUP reference" : "FOLL_PIN pin");
@@ -241,21 +302,21 @@ static int run_tests(void)
 	*p = 0x52;
 	publishes = stat_value("publishes");
 	require(command("test_fail_after", 1) == 0, "inject failure after first PTE");
-	ret = command("arm", (uintptr_t)p);
+	ret = cmdp_request(true, (uintptr_t)p);
 	*p = 0x53;
 	ksft_test_result(ret == -1 && stat_value("publishes") == publishes &&
 			 *p == 0x53 && balanced(), "partial protection failure leaves ordinary RO fault usable\n");
 
 	for (i = 0; i < 64; i++) {
-		require(command("arm", (uintptr_t)p) == 0, "repeat arm");
+		require(cmdp_request(true, (uintptr_t)p) == 0, "repeat arm");
 		*p = i;
 		require(balanced(), "cycle ref/isolation balance");
 	}
 	ksft_test_result_pass("64 arm/write cycles balance ownership\n");
 
-	require(command("arm", (uintptr_t)p) == 0, "arm old generation");
-	require(command("revoke", (uintptr_t)p) == 0, "revoke old generation");
-	require(command("arm", (uintptr_t)p) == 0, "arm new generation");
+	require(cmdp_request(true, (uintptr_t)p) == 0, "arm old generation");
+	require(cmdp_request(false, (uintptr_t)p) == 0, "revoke old generation");
+	require(cmdp_request(true, (uintptr_t)p) == 0, "arm new generation");
 	stale = stat_value("stale");
 	revokes = stat_value("revokes");
 	require(command("test_stale", (uintptr_t)p) == 0, "old completion injection");
@@ -271,6 +332,8 @@ static int run_tests(void)
 			 "munmap synchronously drains and releases ownership\n");
 	close(control);
 	control = -1;
+	close(cmdp_fd);
+	cmdp_fd = -1;
 	exit_cleanup();
 	ksft_finished();
 	return 0;
