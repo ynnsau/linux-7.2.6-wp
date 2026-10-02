@@ -6,6 +6,7 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/init.h>
+#include <linux/miscdevice.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
@@ -20,6 +21,7 @@
 #include <linux/uaccess.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/xarray.h>
+#include <uapi/linux/cmdp.h>
 
 #include "internal.h"
 
@@ -81,10 +83,12 @@ struct cmdp_session {
 	struct mmu_notifier notifier;
 	struct mm_struct *mm;
 	refcount_t refs;
+	atomic_t open_files;
 	struct mutex commands;
 	/* The registry lock also protects this list, closing and cmdp_owner. */
 	struct list_head entries;
 	bool closing;
+	bool notifier_registered;
 #ifdef CONFIG_CMDP_TEST
 	struct page *test_page;
 	bool test_pinned;
@@ -682,17 +686,194 @@ unlock:
 }
 #endif
 
-static ssize_t cmdp_control_write(struct file *file, const char __user *buf,
+static int cmdp_session_open(struct mm_struct *mm, struct cmdp_session **result)
+{
+	struct cmdp_session *s, *owner;
+	unsigned long flags;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN) || !mm)
+		return -EPERM;
+	s = kzalloc_obj(*s);
+	if (!s)
+		return -ENOMEM;
+	s->mm = mm;
+	mmgrab(mm); /* Structural lifetime only; do not hold mm_users across exit. */
+	refcount_set(&s->refs, 1); /* Owner reference. */
+	atomic_set(&s->open_files, 1);
+	mutex_init(&s->commands);
+	INIT_LIST_HEAD(&s->entries);
+	s->notifier.ops = &cmdp_notifier_ops;
+
+	xa_lock_irqsave(&cmdp_entries, flags);
+	owner = cmdp_owner;
+	if (owner) {
+		if (owner->mm != mm || owner->closing ||
+		    !owner->notifier_registered) {
+			ret = -EBUSY;
+		} else {
+			/* Debugfs fixtures and /dev/cmdp share one mm/session. */
+			refcount_inc(&owner->refs);
+			atomic_inc(&owner->open_files);
+			*result = owner;
+			ret = 1;
+		}
+		xa_unlock_irqrestore(&cmdp_entries, flags);
+		cmdp_session_put(s);
+		return ret < 0 ? ret : 0;
+	}
+	cmdp_owner = s;
+	xa_unlock_irqrestore(&cmdp_entries, flags);
+
+	ret = mmu_notifier_register(&s->notifier, mm);
+	if (ret) {
+		xa_lock_irqsave(&cmdp_entries, flags);
+		if (cmdp_owner == s)
+			cmdp_owner = NULL;
+		xa_unlock_irqrestore(&cmdp_entries, flags);
+		cmdp_session_put(s);
+		return ret;
+	}
+	xa_lock_irqsave(&cmdp_entries, flags);
+	s->notifier_registered = true;
+	refcount_inc(&s->refs); /* File reference. */
+	xa_unlock_irqrestore(&cmdp_entries, flags);
+	*result = s;
+	return 0;
+}
+
+static int cmdp_session_lock(struct cmdp_session *s)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN) || current->mm != s->mm)
+		return -EPERM;
+	if (mutex_lock_killable(&s->commands))
+		return -EINTR;
+	xa_lock_irqsave(&cmdp_entries, flags);
+	ret = s->closing ? -ESHUTDOWN : 0;
+	xa_unlock_irqrestore(&cmdp_entries, flags);
+	if (ret)
+		mutex_unlock(&s->commands);
+	return ret;
+}
+
+static int cmdp_validate_addr(u64 addr)
+{
+	if (!PAGE_ALIGNED(addr) || addr >= TASK_SIZE_MAX)
+		return -EINVAL;
+	return 0;
+}
+
+static int cmdp_session_arm(struct cmdp_session *s, u64 addr)
+{
+	int ret = cmdp_session_lock(s);
+
+	if (ret)
+		return ret;
+	ret = cmdp_validate_addr(addr);
+	if (!ret)
+		ret = cmdp_arm(s, (unsigned long)addr);
+	mutex_unlock(&s->commands);
+	return ret;
+}
+
+static int cmdp_session_revoke(struct cmdp_session *s, u64 addr)
+{
+	struct cmdp_entry *e;
+	int ret = cmdp_session_lock(s);
+
+	if (ret)
+		return ret;
+	ret = cmdp_validate_addr(addr);
+	if (!ret) {
+		e = cmdp_find_range(s, (unsigned long)addr,
+				   (unsigned long)addr + PAGE_SIZE);
+		ret = e ? cmdp_revoke(e, "command") : -ENOENT;
+		if (e)
+			cmdp_put(e);
+	}
+	mutex_unlock(&s->commands);
+	return ret;
+}
+
+static int cmdp_device_open(struct inode *inode, struct file *file)
+{
+	struct cmdp_session *s;
+	int ret = cmdp_session_open(current->mm, &s);
+
+	if (!ret)
+		file->private_data = s;
+	return ret;
+}
+
+static long cmdp_device_ioctl(struct file *file, unsigned int cmd,
+			      unsigned long arg)
+{
+	struct cmdp_session *s = file->private_data;
+	struct cmdp_page_req req;
+	int ret;
+
+	if (cmd != CMDP_IOC_ARM && cmd != CMDP_IOC_REVOKE)
+		return -ENOTTY;
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+	if (req.flags)
+		return -EINVAL;
+	if (cmd == CMDP_IOC_ARM)
+		ret = cmdp_session_arm(s, req.addr);
+	else
+		ret = cmdp_session_revoke(s, req.addr);
+	return ret;
+}
+
+static int cmdp_session_close(struct cmdp_session *s)
+{
+	unsigned long flags;
+	bool last, unregister;
+
+	xa_lock_irqsave(&cmdp_entries, flags);
+	last = atomic_dec_and_test(&s->open_files);
+	if (last)
+		s->closing = true;
+	unregister = last && s->notifier_registered;
+	if (unregister)
+		s->notifier_registered = false;
+	xa_unlock_irqrestore(&cmdp_entries, flags);
+
+	if (last) {
+		cmdp_release_mm(&s->notifier, s->mm);
+		/* Wait for any invalidation/release callbacks to finish. */
+		if (unregister)
+			mmu_notifier_unregister(&s->notifier, s->mm);
+#ifdef CONFIG_CMDP_TEST
+		cmdp_test_drop(s);
+#endif
+		xa_lock_irqsave(&cmdp_entries, flags);
+		if (cmdp_owner == s)
+			cmdp_owner = NULL;
+		xa_unlock_irqrestore(&cmdp_entries, flags);
+		cmdp_session_put(s); /* Owner reference. */
+	}
+	cmdp_session_put(s); /* File reference. */
+	return 0;
+}
+
+static int cmdp_device_release(struct inode *inode, struct file *file)
+{
+	return cmdp_session_close(file->private_data);
+}
+
+static long cmdp_control_write(struct file *file, const char __user *buf,
 				  size_t count, loff_t *ppos)
 {
 	struct cmdp_session *s = file->private_data;
 	struct cmdp_entry *e;
 	char text[96], command[24], extra;
-	unsigned long value, flags;
+	unsigned long value;
 	int ret, fields;
 
-	if (!capable(CAP_SYS_ADMIN) || current->mm != s->mm)
-		return -EPERM;
 	if (!count || count >= sizeof(text))
 		return -EINVAL;
 	if (copy_from_user(text, buf, count))
@@ -701,108 +882,69 @@ static ssize_t cmdp_control_write(struct file *file, const char __user *buf,
 	fields = sscanf(text, "%23s %lx %c", command, &value, &extra);
 	if (fields != 2)
 		return -EINVAL;
-	if (mutex_lock_killable(&s->commands))
-		return -EINTR;
-	xa_lock_irqsave(&cmdp_entries, flags);
-	ret = s->closing ? -ESHUTDOWN : 0;
-	xa_unlock_irqrestore(&cmdp_entries, flags);
-	if (ret)
-		goto out;
-
-	if (!strcmp(command, "arm") || !strcmp(command, "revoke")) {
-		if (!PAGE_ALIGNED(value) || value >= TASK_SIZE_MAX) {
-			ret = -EINVAL;
-			goto out;
-		}
-		if (!strcmp(command, "arm")) {
-			ret = cmdp_arm(s, value);
-		} else {
-			e = cmdp_find_range(s, value, value + PAGE_SIZE);
-			ret = e ? cmdp_revoke(e, "command") : -ENOENT;
-			if (e)
-				cmdp_put(e);
-		}
+	if (!strcmp(command, "arm"))
+		ret = cmdp_session_arm(s, value);
+	else if (!strcmp(command, "revoke"))
+		ret = cmdp_session_revoke(s, value);
 #ifdef CONFIG_CMDP_TEST
-	} else if (!strcmp(command, "test_pin") || !strcmp(command, "test_get")) {
-		ret = cmdp_test_hold(s, value, !strcmp(command, "test_pin"));
-	} else if (!strcmp(command, "test_drop")) {
-		cmdp_test_drop(s);
-	} else if (!strcmp(command, "test_fail_after")) {
-		s->fail_after = min_t(unsigned long, value, CMDP_MAX_ALIASES);
-	} else if (!strcmp(command, "test_delay_ms")) {
-		WRITE_ONCE(s->revoke_delay_ms, min_t(unsigned long, value, 1000));
-	} else if (!strcmp(command, "test_stale")) {
-		e = cmdp_find_range(s, value, value + PAGE_SIZE);
-		if (!e) {
-			ret = -ENOENT;
+	else {
+		ret = cmdp_session_lock(s);
+		if (ret)
+			return ret;
+		if (!strcmp(command, "test_pin") || !strcmp(command, "test_get")) {
+			ret = cmdp_validate_addr(value);
+			if (!ret)
+				ret = cmdp_test_hold(s, value,
+						    !strcmp(command, "test_pin"));
+		} else if (!strcmp(command, "test_drop")) {
+			cmdp_test_drop(s);
+			ret = 0;
+		} else if (!strcmp(command, "test_fail_after")) {
+			s->fail_after = min_t(unsigned long, value,
+					      CMDP_MAX_ALIASES);
+			ret = 0;
+		} else if (!strcmp(command, "test_delay_ms")) {
+			WRITE_ONCE(s->revoke_delay_ms,
+				   min_t(unsigned long, value, 1000));
+			ret = 0;
+		} else if (!strcmp(command, "test_stale")) {
+			ret = cmdp_validate_addr(value);
+			if (!ret) {
+				e = cmdp_find_range(s, value, value + PAGE_SIZE);
+				if (!e)
+					ret = -ENOENT;
+				else {
+					ret = cmdp_hw_complete(e->pfn,
+							e->generation - 1,
+							CMDP_REVOKE, 0) ? -EIO : 0;
+					cmdp_put(e);
+				}
+			}
 		} else {
-			ret = cmdp_hw_complete(e->pfn, e->generation - 1,
-					       CMDP_REVOKE, 0) ? -EIO : 0;
-			cmdp_put(e);
+			ret = -EINVAL;
 		}
-#endif
-	} else {
-		ret = -EINVAL;
+		mutex_unlock(&s->commands);
 	}
-out:
-	mutex_unlock(&s->commands);
+#else
+	else
+		ret = -EINVAL;
+#endif
 	return ret ? ret : count;
 }
 
 static int cmdp_control_open(struct inode *inode, struct file *file)
 {
 	struct cmdp_session *s;
-	unsigned long flags;
-	int ret;
+	int ret = cmdp_session_open(current->mm, &s);
 
-	if (!capable(CAP_SYS_ADMIN) || !current->mm)
-		return -EPERM;
-	s = kzalloc_obj(*s);
-	if (!s)
-		return -ENOMEM;
-	s->mm = current->mm;
-	mmgrab(s->mm); /* mm_count, never an indefinite mm_users reference */
-	refcount_set(&s->refs, 1);
-	mutex_init(&s->commands);
-	INIT_LIST_HEAD(&s->entries);
-	s->notifier.ops = &cmdp_notifier_ops;
-	xa_lock_irqsave(&cmdp_entries, flags);
-	ret = cmdp_owner ? -EBUSY : 0;
 	if (!ret)
-		cmdp_owner = s;
-	xa_unlock_irqrestore(&cmdp_entries, flags);
-	if (ret)
-		goto put;
-	ret = mmu_notifier_register(&s->notifier, s->mm);
-	if (ret) {
-		xa_lock_irqsave(&cmdp_entries, flags);
-		cmdp_owner = NULL;
-		xa_unlock_irqrestore(&cmdp_entries, flags);
-		goto put;
-	}
-	file->private_data = s;
-	return 0;
-put:
-	cmdp_session_put(s);
+		file->private_data = s;
 	return ret;
 }
 
 static int cmdp_control_release(struct inode *inode, struct file *file)
 {
-	struct cmdp_session *s = file->private_data;
-	unsigned long flags;
-
-	cmdp_release_mm(&s->notifier, s->mm);
-	/* Outside callbacks/locks: waits for in-flight notifier invocations. */
-	mmu_notifier_unregister(&s->notifier, s->mm);
-#ifdef CONFIG_CMDP_TEST
-	cmdp_test_drop(s);
-#endif
-	xa_lock_irqsave(&cmdp_entries, flags);
-	cmdp_owner = NULL;
-	xa_unlock_irqrestore(&cmdp_entries, flags);
-	cmdp_session_put(s);
-	return 0;
+	return cmdp_session_close(file->private_data);
 }
 
 static const struct file_operations cmdp_control_fops = {
@@ -810,6 +952,20 @@ static const struct file_operations cmdp_control_fops = {
 	.open = cmdp_control_open,
 	.write = cmdp_control_write,
 	.release = cmdp_control_release,
+};
+
+static const struct file_operations cmdp_device_fops = {
+	.owner = THIS_MODULE,
+	.open = cmdp_device_open,
+	.unlocked_ioctl = cmdp_device_ioctl,
+	.release = cmdp_device_release,
+};
+
+static struct miscdevice cmdp_misc_device = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "cmdp",
+	.fops = &cmdp_device_fops,
+	.mode = 0600,
 };
 
 static int cmdp_stats_show(struct seq_file *m, void *unused)
@@ -826,7 +982,11 @@ DEFINE_SHOW_ATTRIBUTE(cmdp_stats);
 static int __init cmdp_init(void)
 {
 	struct dentry *dir = debugfs_create_dir("cmdp", NULL);
+	int ret;
 
+	ret = misc_register(&cmdp_misc_device);
+	if (ret)
+		return ret;
 	debugfs_create_file("control", 0600, dir, NULL, &cmdp_control_fops);
 	debugfs_create_file("stats", 0400, dir, NULL, &cmdp_stats_fops);
 	return 0;
