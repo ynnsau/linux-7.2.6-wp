@@ -1,7 +1,11 @@
 # CMD-P v2: consolidated write-protection study
 
-Status: proposed plan grounded in this source tree; no prototype or measurements
-have been implemented. The tree's Makefile identifies it as 7.2.6.
+Status: research plan grounded in this source tree. A restricted CMD-P v1
+prototype is implemented, benchmarked, and validated. The broader all-writers
+contract, automatic selection, real hardware, and physical-hardware measurements
+remain future work. The tree's Makefile identifies it as 7.2.6. See the
+[implementation README](../tools/testing/selftests/cmdp/README.md) and
+[benchmark results](../tools/testing/selftests/cmdp/BENCHMARK.md) for v1 details.
 
 ## Objective
 
@@ -20,6 +24,36 @@ and cheaply?** Then, **which pages stay useful long enough to justify the cost?*
 Implement explicit selection first; add automatic selection after measuring the
 mechanism. A history without writes predicts usefulness; it does not guarantee
 that the next access will be a read.
+
+## Original PI checklist status
+
+The original write-protection and implementation questions are answered for
+the restricted software prototype:
+
+### Understanding write-protect
+
+1. How x86/Linux handles write protection: **DONE**. See the source map above
+   and `do_wp_page()`, the x86 PTE helpers, and synchronous TLB invalidation.
+2. Who installs write protection and when: **DONE**. The source map covers
+   mprotect, fork/COW, soft-dirty, userfaultfd, and file-backed fault paths.
+3. When write protection is removed: **DONE**. The source map records the
+   normal Linux reuse/COW flow and the CMD-P-specific revoke/refault path.
+
+### Implementation and testing
+
+1. Userspace control for selected pages through ioctl(2): **DONE** with
+   `CMDP_IOC_ARM` and `CMDP_IOC_REVOKE` on `/dev/cmdp`. `ioctl(2)` supplies the
+   control syscall for this experiment without allocating a global Linux
+   syscall number.
+2. Kernel implementation for explicitly selected pages: **DONE** in the in-tree
+   MM, using a privileged miscdevice session bound to one mm.
+3. CMD-P-specific protection and dummy publish/revoke without forcing COW:
+   **DONE** for eligible pages. The dummy backend exercises ordering; after
+   revoke Linux's ordinary write-protection, COW, and reuse rules decide the
+   write fault.
+4. Arm and first-write overhead measurement: **DONE** for the software
+   prototype. See the 1,000-sample QEMU measurements in `BENCHMARK.md`; they do
+   not measure real device behavior.
 
 ## What existing Linux mechanisms tell us
 
@@ -120,6 +154,10 @@ hardware completion or ordering. Disable logging for latency measurements.
 
 ### 1. Establish userspace baselines
 
+Status: not completed. The existing CMD-P selftest validates the kernel
+prototype, but does not replace the separate `mprotect` and userfaultfd
+baselines below.
+
 Create a small program that allocates and write-touches a page-aligned range.
 
 - Measure a normal read/write baseline.
@@ -137,6 +175,15 @@ These tests establish mapping-level behavior only; neither interface alone
 enforces the all-writers physical-page requirement.
 
 ### 2. Add a kernel CMD-P mechanism with explicit registration
+
+Status: completed for the restricted v1 experiment. The in-tree MM integration
+uses a privileged `/dev/cmdp` miscdevice and ioctl UAPI. It tracks physical-page
+membership with `PG_cmdp`, an XArray keyed by
+PFN, and per-entry state/generation/refcounts/completions. Arming protects
+supported aliases, flushes their TLB entries, checks pins/references, and then
+uses a dummy publish completion. The first write revokes before Linux's normal
+write-protection handling; the selftest verifies same-PFN completion. Real
+hardware publication and general writer coverage remain outside v1.
 
 Implement one shared kernel arm/revoke mechanism and a userspace test control
 interface, provisionally a device ioctl on the caller's own address range.
@@ -158,6 +205,16 @@ and verify fault-path behavior; minor-fault counts alone cannot establish no COW
 
 ### 3. Verify races and lifetime handling
 
+Status: completed for the supported v1 transitions only. QEMU selftests pass
+14 checks, including 64 repeated arm/revoke cycles, two concurrent writers
+with one revoke owner and one waiter, pin/reference rejection, stale completion
+rejection, munmap, and process-exit cleanup. MMU-notifier invalidation/release
+and LRU isolation cover the supported lifecycle. The final counters were `entries=0`,
+`managed=0`, and `isolated=0`. The broader races and writer classes listed
+below remain open, including fork while ACTIVE, UFFD, multiple mms, and generic
+DMA. A separate QEMU build with lockdep and atomic-sleep checking enabled passed
+the same 14 tests without lockdep or atomic-sleep reports.
+
 Test repeated arm/write cycles, competing writers, arm-versus-write races, and
 unregister/unmap/exit. Add explicit handling or rejection for fork, mprotect,
 mremap, migration/reclaim, new pins, and other ways an active mapping can change.
@@ -175,6 +232,12 @@ to modify an admitted page must be excluded or ordered after revocation. This
 gate precedes real hardware or general-workload claims.
 
 ### 4. Measure costs
+
+Status: completed for the restricted software prototype. `cmdp_bench` reports
+baseline stores, ioctl arm, first-write/revoke, timestamp overhead, and
+per-operation `arm_ns`/`revoke_ns` counter deltas with 1,000-sample distributions.
+These QEMU timings describe the software path only; comparisons with real
+hardware and application workloads remain future work.
 
 Start with userspace TSC timing for end-to-end costs, then add kernel tracing to
 explain them. Keep baseline, stub CMD-P, and eventual real MMIO results separate.
@@ -207,6 +270,8 @@ Measure without tracing as well to quantify instrumentation overhead.
 
 ### 5. Select pages automatically
 
+Status: not started. V1 uses explicit manual arming.
+
 Define a tunable no-write observation window and cooldown after a write.
 Soft-dirty provides a first experimental write-history signal, but clearing it
 itself introduces WP faults and therefore has a measurement and runtime cost.
@@ -230,6 +295,8 @@ benefit against protection, revocation, observation, and fault overhead.
 - What are entry granularity/capacity and behavior on eviction, context switch,
   address reuse, and page migration?
 
-The immediate next deliverable is the milestone 1 baseline program and a short
-design for milestone 2's metadata, locking, and control interface. Keep automatic
-selection and real MMIO behind their respective correctness and measurement gates.
+The restricted v1 mechanism supplies milestone 2's metadata, locking, and
+control experiment. Milestone 1 baselines, systematic milestone 4 measurements,
+and the remaining milestone 3 writer/lifecycle coverage still gate broader
+claims. Keep automatic selection and real MMIO behind their respective
+correctness and measurement gates.

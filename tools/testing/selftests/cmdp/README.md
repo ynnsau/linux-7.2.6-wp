@@ -1,8 +1,11 @@
 # CMD-P v1 prototype
 
 This is a restricted native x86-64 physical-page write-protection experiment.
-It has no real CXL/CMD-P device protocol. `CONFIG_CMDP_TEST` provides fixtures
-for the selftest; root can arm a page through debugfs `cmdp/control`.
+It has no real CXL/CMD-P device protocol. The primary control interface is the
+privileged `/dev/cmdp` miscdevice, with `CMDP_IOC_ARM` and `CMDP_IOC_REVOKE`
+ioctls taking a page-aligned address and zero flags. Its fd binds one CMD-P
+session to the opener's mm. Debugfs remains available for statistics and
+`CONFIG_CMDP_TEST` fixtures; the selftest uses it only for those purposes.
 
 ## Implemented design
 
@@ -43,12 +46,17 @@ while `ACTIVE`, and mremap while `ACTIVE`.
 ## Validation status
 
 The full `vmlinux` build passed with `W=1` and `CONFIG_WERROR=y`; the CMD-P
-selftest built, and an isolated QEMU x86-64 guest booted with `CONFIG_CMDP=y`.
-All 11 runtime selftests passed, including 64 repeated arm/revoke cycles,
-concurrent writers, munmap, and process exit. Final manager counters were
-`entries=0 managed=0 isolated=0`.
+selftest and benchmark built, and an isolated QEMU x86-64 guest booted with
+`CONFIG_CMDP=y`. All 14 runtime selftests passed, including ioctl validation,
+64 repeated arm/revoke cycles, concurrent writers, munmap, and process exit.
+Final manager counters were `entries=0 managed=0 isolated=0`.
+
+The 1,000-sample QEMU benchmark methodology and measured results are in
+[BENCHMARK.md](BENCHMARK.md). Those timings measure the software prototype,
+not physical CMD-P hardware.
 
 Runtime testing found that immediate re-arm could fail while LRU putback was
 still queued in a per-CPU batch. Re-arm now drains that batch when necessary
-before isolation. Lockdep (`CONFIG_PROVE_LOCKING`) has not been exercised, and
-real hardware coherence/drain semantics remain unimplemented.
+before isolation. A separate QEMU kernel with `CONFIG_PROVE_LOCKING` and
+`CONFIG_DEBUG_ATOMIC_SLEEP` passed the same 14 tests without lockdep or atomic
+sleep reports. Real hardware coherence/drain semantics remain unimplemented.
