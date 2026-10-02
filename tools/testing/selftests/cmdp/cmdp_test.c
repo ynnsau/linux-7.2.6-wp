@@ -224,7 +224,7 @@ static int run_tests(void)
 		close(control);
 		ksft_exit_skip("CONFIG_CMDP_TEST required\n");
 	}
-	ksft_set_plan(14);
+	ksft_set_plan(18);
 	{
 		pid_t child = fork();
 		int status;
@@ -285,6 +285,47 @@ static int run_tests(void)
 		rejected &= ioctl(cmdp_fd, CMDP_IOC_ARM, &invalid) == -1 &&
 			errno == EINVAL;
 		ksft_test_result(rejected, "ioctl rejects unaligned address and flags\n");
+	}
+	{
+		struct cmdp_page_req invalid = { .addr = UINT64_MAX, .flags = 0 };
+		int fd;
+		bool rejected;
+
+		errno = 0;
+		rejected = ioctl(cmdp_fd, CMDP_IOC_ARM, &invalid) == -1 &&
+			errno == EINVAL;
+		ksft_test_result(rejected && balanced(),
+				 "ioctl rejects out-of-range address\n");
+
+		{
+			void *shared = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+					    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+			require(shared != MAP_FAILED, "mmap shared test page");
+			*(volatile unsigned char *)shared = 0x61;
+			errno = 0;
+			rejected = cmdp_request(true, (uintptr_t)shared) == -1 &&
+				errno == EOPNOTSUPP;
+			require(munmap(shared, PAGE) == 0, "munmap shared test page");
+		}
+		ksft_test_result(rejected && balanced(),
+				 "ioctl rejects unsupported shared mapping\n");
+
+		errno = 0;
+		rejected = cmdp_request(false, (uintptr_t)p) == -1 &&
+			errno == ENOENT;
+		ksft_test_result(rejected && balanced(),
+				 "ioctl revoke rejects unmanaged page\n");
+
+		fd = open(DEVICE, O_RDWR);
+		require(fd >= 0, "open duplicate session fd");
+		close(fd);
+		errno = 0;
+		rejected = ioctl(fd, CMDP_IOC_REVOKE, &(struct cmdp_page_req) {
+			.addr = (uintptr_t)p, .flags = 0,
+		}) == -1 && errno == EBADF;
+		ksft_test_result(rejected && balanced(),
+				 "closed session fd rejects further ioctl\n");
 	}
 	concurrent_writers(p);
 

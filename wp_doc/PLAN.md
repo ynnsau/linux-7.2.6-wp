@@ -206,14 +206,15 @@ and verify fault-path behavior; minor-fault counts alone cannot establish no COW
 ### 3. Verify races and lifetime handling
 
 Status: completed for the supported v1 transitions only. QEMU selftests pass
-14 checks, including 64 repeated arm/revoke cycles, two concurrent writers
+18 checks, including invalid ioctl inputs, unsupported mapping rejection,
+unmanaged revoke, 64 repeated arm/revoke cycles, two concurrent writers
 with one revoke owner and one waiter, pin/reference rejection, stale completion
 rejection, munmap, and process-exit cleanup. MMU-notifier invalidation/release
 and LRU isolation cover the supported lifecycle. The final counters were `entries=0`,
 `managed=0`, and `isolated=0`. The broader races and writer classes listed
 below remain open, including fork while ACTIVE, UFFD, multiple mms, and generic
 DMA. A separate QEMU build with lockdep and atomic-sleep checking enabled passed
-the same 14 tests without lockdep or atomic-sleep reports.
+the same 18 tests without lockdep or atomic-sleep reports.
 
 Test repeated arm/write cycles, competing writers, arm-versus-write races, and
 unregister/unmap/exit. Add explicit handling or rejection for fork, mprotect,

@@ -37,15 +37,15 @@ One QEMU run produced the following measurements:
 
 | Operation | Unit | Min | Median | p95 | p99 | Max |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Empty timestamp pair | TSC ticks/pair | 20 | 40 | 40 | 40 | 40 |
-| Ordinary store | TSC ticks/store | 3.98 | 4.06 | 4.06 | 5.08 | 286.48 |
-| `CMDP_IOC_ARM` end-to-end | TSC ticks/op | 6,940 | 7,880 | 17,080 | 25,880 | 282,000 |
-| First store and revoke | TSC ticks/op | 4,260 | 4,800 | 8,620 | 10,160 | 283,920 |
-| Kernel arm counter delta | ns/op | 2,846 | 3,226 | 7,143 | 9,117 | 38,693 |
-| Kernel revoke counter delta | ns/op | 711 | 801 | 1,343 | 1,623 | 58,321 |
+| Empty timestamp pair | TSC ticks/pair | 20 | 20 | 40 | 40 | 40 |
+| Ordinary store | TSC ticks/store | 3.36 | 3.44 | 3.44 | 3.44 | 261.25 |
+| `CMDP_IOC_ARM` end-to-end | TSC ticks/op | 5,640 | 5,960 | 11,360 | 17,100 | 105,780 |
+| First store and revoke | TSC ticks/op | 3,680 | 3,840 | 4,580 | 8,760 | 111,580 |
+| Kernel arm counter delta | ns/op | 2,324 | 2,435 | 4,729 | 7,023 | 51,297 |
+| Kernel revoke counter delta | ns/op | 641 | 651 | 731 | 1,422 | 20,018 |
 
-The same run reported `CLOCK_MONOTONIC_RAW ordinary_store_avg_ns=2.32` and
-`cmdp_full_loop_avg_ns=37881`; the latter includes debugfs counter reads. The
+The same run reported `CLOCK_MONOTONIC_RAW ordinary_store_avg_ns=1.77` and
+`cmdp_full_loop_avg_ns=25059`; the latter includes debugfs counter reads. The
 kernel counters ended at `entries=0 managed=0 isolated=0`. Large maximum values
 reflect guest scheduling/interference. These results describe only the
 software/prototype path and are not representative of final physical CMD-P
@@ -53,13 +53,14 @@ hardware performance.
 
 ## Validation
 
-The normal QEMU run passed all 14 CMD-P selftests, including invalid and
-foreign-mm ioctl checks, concurrent writers, repeated cycles, munmap, and
-process-exit cleanup. Final manager counters were zero for `entries`, `managed`,
-and `isolated`.
+The normal QEMU run passed all 18 CMD-P selftests, including unaligned and
+out-of-range ioctl requests, unsupported shared mapping, unmanaged revoke,
+closed-fd behavior, foreign-mm rejection, concurrent writers, repeated cycles,
+munmap, and process-exit cleanup. Final manager counters were zero for
+`entries`, `managed`, and `isolated`.
 
 A separate `W=1`, `CONFIG_WERROR=y` kernel with `CONFIG_LOCKDEP=y`,
 `CONFIG_PROVE_LOCKING=y`, `CONFIG_DEBUG_LOCK_ALLOC=y`, and
-`CONFIG_DEBUG_ATOMIC_SLEEP=y` booted in QEMU and passed the same 14 tests.
+`CONFIG_DEBUG_ATOMIC_SLEEP=y` booted in QEMU and passed the same 18 tests.
 The lockdep guest finished with `entries=0 managed=0 isolated=0`; no lockdep,
 atomic-sleep, refcount, hung-task, or CMD-P warning was reported.

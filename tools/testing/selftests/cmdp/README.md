@@ -47,7 +47,8 @@ while `ACTIVE`, and mremap while `ACTIVE`.
 
 The full `vmlinux` build passed with `W=1` and `CONFIG_WERROR=y`; the CMD-P
 selftest and benchmark built, and an isolated QEMU x86-64 guest booted with
-`CONFIG_CMDP=y`. All 14 runtime selftests passed, including ioctl validation,
+`CONFIG_CMDP=y`. All 18 runtime selftests passed, including invalid/out-of-range
+ioctl requests, unsupported mappings, unmanaged revoke, closed-fd behavior,
 64 repeated arm/revoke cycles, concurrent writers, munmap, and process exit.
 Final manager counters were `entries=0 managed=0 isolated=0`.
 
@@ -58,5 +59,5 @@ not physical CMD-P hardware.
 Runtime testing found that immediate re-arm could fail while LRU putback was
 still queued in a per-CPU batch. Re-arm now drains that batch when necessary
 before isolation. A separate QEMU kernel with `CONFIG_PROVE_LOCKING` and
-`CONFIG_DEBUG_ATOMIC_SLEEP` passed the same 14 tests without lockdep or atomic
+`CONFIG_DEBUG_ATOMIC_SLEEP` passed the same 18 tests without lockdep or atomic
 sleep reports. Real hardware coherence/drain semantics remain unimplemented.
