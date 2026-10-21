@@ -7,6 +7,7 @@
  */
 
 #include <linux/mman.h>
+#include <linux/cmdp.h>
 #include <linux/pagemap.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
@@ -1416,6 +1417,8 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		break;
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
+		if (behavior == MADV_MERGEABLE)
+			cmdp_mm_stop_locked(vma->vm_mm, CMDP_MON_SCOPE_CHANGE);
 		error = ksm_madvise(vma, range->start, range->end,
 				behavior, &new_flags);
 		if (error)
@@ -1423,6 +1426,8 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		break;
 	case MADV_HUGEPAGE:
 	case MADV_NOHUGEPAGE:
+		if (behavior == MADV_HUGEPAGE)
+			cmdp_mm_stop_locked(vma->vm_mm, CMDP_MON_THP_CHANGE);
 		error = hugepage_madvise(vma, &new_flags, behavior);
 		if (error)
 			goto out;

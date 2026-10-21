@@ -11,6 +11,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/cmdp.h>
 #include <linux/sched/signal.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -3711,6 +3712,8 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 	} for_each_vma_range(vmi, cur, end);
 	VM_WARN_ON_ONCE(!found);
 
+	/* Withdraw prototype ownership before adding another WP/fault owner. */
+	cmdp_mm_stop_locked(mm, CMDP_MON_SCOPE_CHANGE);
 	ret = userfaultfd_register_range(ctx, vma, vm_flags, start, end,
 					 wp_async);
 

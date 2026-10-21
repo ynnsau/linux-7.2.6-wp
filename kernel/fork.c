@@ -13,6 +13,7 @@
  */
 
 #include <linux/anon_inodes.h>
+#include <linux/cmdp.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
@@ -1509,6 +1510,7 @@ void exit_mm_release(struct task_struct *tsk, struct mm_struct *mm)
 
 void exec_mm_release(struct task_struct *tsk, struct mm_struct *mm)
 {
+	cmdp_mm_stop(mm, CMDP_MON_EXEC);
 	futex_exec_release(tsk);
 	mm_release(tsk, mm);
 }
@@ -1588,6 +1590,8 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 		return 0;
 
 	if (clone_flags & CLONE_VM) {
+		if (!(clone_flags & CLONE_THREAD))
+			cmdp_mm_stop(oldmm, CMDP_MON_FORK);
 		mmget(oldmm);
 		mm = oldmm;
 	} else {
@@ -2537,6 +2541,12 @@ __latent_entropy struct task_struct *copy_process(
 	spin_unlock(&current->sighand->siglock);
 	syscall_tracepoint_update(p);
 	write_unlock_irq(&tasklist_lock);
+
+	/* The child is visible to external monitor attachment now. A second
+	 * stop closes attachment racing the early copy_mm() CLONE_VM check.
+	 */
+	if ((clone_flags & CLONE_VM) && !(clone_flags & CLONE_THREAD))
+		cmdp_mm_stop(p->mm, CMDP_MON_FORK);
 
 	if (pidfile)
 		fd_install(pidfd, pidfile);

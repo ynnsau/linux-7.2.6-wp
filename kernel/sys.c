@@ -6,6 +6,7 @@
  */
 
 #include <linux/export.h>
+#include <linux/cmdp.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
 #include <linux/utsname.h>
@@ -2515,6 +2516,8 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 		return -EINVAL;
 	if (mmap_write_lock_killable(current->mm))
 		return -EINTR;
+	if (!thp_disable || (flags & PR_THP_DISABLE_EXCEPT_ADVISED))
+		cmdp_mm_stop_locked(mm, CMDP_MON_THP_CHANGE);
 	if (thp_disable) {
 		if (flags & PR_THP_DISABLE_EXCEPT_ADVISED) {
 			mm_flags_clear(MMF_DISABLE_THP_COMPLETELY, mm);
@@ -2839,10 +2842,12 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (mmap_write_lock_killable(me->mm))
 			return -EINTR;
 
-		if (arg2)
+		if (arg2) {
+			cmdp_mm_stop_locked(me->mm, CMDP_MON_SCOPE_CHANGE);
 			error = ksm_enable_merge_any(me->mm);
-		else
+		} else {
 			error = ksm_disable_merge_any(me->mm);
+		}
 		mmap_write_unlock(me->mm);
 		break;
 	case PR_GET_MEMORY_MERGE:

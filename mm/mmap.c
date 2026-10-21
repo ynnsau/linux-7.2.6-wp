@@ -1739,6 +1739,7 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 
 	if (mmap_write_lock_killable(oldmm))
 		return -EINTR;
+	cmdp_mm_stop_locked(oldmm, CMDP_MON_FORK);
 	if (cmdp_mm_active(oldmm)) {
 		mmap_write_unlock(oldmm);
 		return -EBUSY;

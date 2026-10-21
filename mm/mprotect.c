@@ -868,10 +868,9 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	if (mmap_write_lock_killable(current->mm))
 		return -EINTR;
 
-	if (cmdp_mm_active(current->mm)) {
-		error = -EBUSY;
+	error = cmdp_mm_modify(current->mm, start, end);
+	if (error)
 		goto out;
-	}
 
 	/*
 	 * If userspace did not allocate the pkey, do not let
