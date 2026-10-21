@@ -11,9 +11,10 @@ git -C "$src" diff --binary > "$records/source-diff-at-build.patch"
 "$src/scripts/config" --file "$out/.config" \
     --set-str LOCALVERSION '-cmdp-periodic-v1' --disable LOCALVERSION_AUTO
 make -C "$src" O="$out" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= olddefconfig
+make -C "$src" O="$out" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= -j32 bzImage modules
 make -s -C "$src" O="$out" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= kernelrelease \
     > "$records/kernel-release.txt"
-make -C "$src" O="$out" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= -j32 bzImage modules
+test "$(cat "$records/kernel-release.txt")" = 7.2.6-cmdp-periodic-v1
 test -z "$(git -C "$src" status --porcelain=v1)"
 test "$(git -C "$src" rev-parse HEAD)" = "$(cat "$records/source-head-at-build")"
 cp "$out/.config" "$records/config-built"
