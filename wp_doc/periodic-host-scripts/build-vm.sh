@@ -17,6 +17,21 @@ for test in cmdp_test cmdp_monitor cmdp_fixture cmdp_monitor_test; do
             "$src/tools/testing/selftests/cmdp/$test.c" \
             -o "$stage/tests/$test"
 done
+cat > "$stage/tmp/console-drain.c" <<'DRAIN'
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+int main(void)
+{
+    int fd = open("/dev/ttyS0", O_WRONLY | O_NOCTTY);
+    if (fd < 0) return 1;
+    int rc = tcdrain(fd);
+    close(fd);
+    return rc != 0;
+}
+DRAIN
+gcc-13 -static -O2 -Wall -Wextra -Werror "$stage/tmp/console-drain.c" \
+    -o "$stage/tests/console-drain"
 if test -x "$base/gapbs-study/gapbs/bfs"; then
     cp "$base/gapbs-study/gapbs/bfs" "$stage/tests/bfs"
     while read -r lib; do
@@ -67,6 +82,7 @@ fi
 cat /sys/kernel/debug/cmdp/stats
 echo CMDP_VM_RESULT=$rc
 sync
+/tests/console-drain || echo CMDP_CONSOLE_DRAIN_FAILED
 poweroff -f
 INIT
 chmod +x "$stage/init"

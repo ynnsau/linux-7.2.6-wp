@@ -14,6 +14,6 @@ sha256sum -c "$base/periodic/records/vm-$label-inputs.sha256"
 grep -E 'CMDP_VM_|^ok |^not ok |BUG:|WARNING:|Call Trace|Kernel panic|^# Totals' \
     "$base/periodic/logs/vm-$label.log" || true
 grep -q '^CMDP_VM_RESULT=0' "$base/periodic/logs/vm-$label.log"
-if grep -Eq 'BUG:|WARNING:|Kernel panic|possible circular locking|inconsistent lock state' "$base/periodic/logs/vm-$label.log"; then
+if grep -Eq 'BUG:|WARNING:|Kernel panic|possible circular locking|inconsistent lock state|CMDP_CONSOLE_DRAIN_FAILED' "$base/periodic/logs/vm-$label.log"; then
     exit 1
 fi
