@@ -2161,14 +2161,17 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 {
 	struct cmdp_monitor *m = file->private_data;
 	void __user *up = (void __user *)arg;
-	struct cmdp_monitor_attach a;
-	struct cmdp_monitor_status status;
-	struct cmdp_monitor_page page;
-	struct cmdp_monitor_cohort cohort;
-	struct cmdp_monitor_progress progress;
-	struct cmdp_monitor_dirty_config dirty_config;
-	struct cmdp_monitor_dirty_status dirty_status;
-	struct cmdp_monitor_dirty_page dirty_page;
+	/* Each ioctl uses one payload; do not add their sizes to the stack. */
+	union {
+		struct cmdp_monitor_attach a;
+		struct cmdp_monitor_status status;
+		struct cmdp_monitor_page page;
+		struct cmdp_monitor_cohort cohort;
+		struct cmdp_monitor_progress progress;
+		struct cmdp_monitor_dirty_config dirty_config;
+		struct cmdp_monitor_dirty_status dirty_status;
+		struct cmdp_monitor_dirty_page dirty_page;
+	} data;
 	struct cmdp_history *h;
 	struct cmdp_cohort *c;
 	unsigned long flags;
@@ -2190,24 +2193,24 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 	mutex_lock(&m->ctl);
 	switch (cmd) {
 	case CMDP_MON_ATTACH:
-		if (copy_from_user(&a, up, sizeof(a))) {
+		if (copy_from_user(&data.a, up, sizeof(data.a))) {
 			ret = -EFAULT;
 			break;
 		}
-		ret = cmdp_monitor_attach_target(m, &a);
+		ret = cmdp_monitor_attach_target(m, &data.a);
 		break;
 	case CMDP_MON_DIRTY_CONFIG:
-		if (copy_from_user(&dirty_config, up, sizeof(dirty_config))) {
+		if (copy_from_user(&data.dirty_config, up, sizeof(data.dirty_config))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (dirty_config.size != sizeof(dirty_config) ||
-		    dirty_config.version != CMDP_MONITOR_VERSION ||
-		    dirty_config.mode > CMDP_MON_DIRTY_QUALIFY ||
-		    (dirty_config.quiet_ms && dirty_config.quiet_ms < 10) ||
-		    dirty_config.quiet_ms > 3600000 ||
-		    dirty_config.reserved[0] || dirty_config.reserved[1] ||
-		    (dirty_config.mode && (m->status.flags & CMDP_MONITOR_F_SCAN_ONLY))) {
+		if (data.dirty_config.size != sizeof(data.dirty_config) ||
+		    data.dirty_config.version != CMDP_MONITOR_VERSION ||
+		    data.dirty_config.mode > CMDP_MON_DIRTY_QUALIFY ||
+		    (data.dirty_config.quiet_ms && data.dirty_config.quiet_ms < 10) ||
+		    data.dirty_config.quiet_ms > 3600000 ||
+		    data.dirty_config.reserved[0] || data.dirty_config.reserved[1] ||
+		    (data.dirty_config.mode && (m->status.flags & CMDP_MONITOR_F_SCAN_ONLY))) {
 			ret = -EINVAL;
 			break;
 		}
@@ -2216,58 +2219,58 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			ret = -EBUSY;
 			break;
 		}
-		m->dirty.mode = dirty_config.mode;
-		m->dirty.quiet_ms = dirty_config.quiet_ms ?: 10000;
+		m->dirty.mode = data.dirty_config.mode;
+		m->dirty.quiet_ms = data.dirty_config.quiet_ms ?: 10000;
 		break;
 	case CMDP_MON_DIRTY_STATUS:
-		if (copy_from_user(&dirty_status, up, sizeof(dirty_status))) {
+		if (copy_from_user(&data.dirty_status, up, sizeof(data.dirty_status))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (dirty_status.size != sizeof(dirty_status) ||
-		    dirty_status.version != CMDP_MONITOR_VERSION) {
+		if (data.dirty_status.size != sizeof(data.dirty_status) ||
+		    data.dirty_status.version != CMDP_MONITOR_VERSION) {
 			ret = -EINVAL;
 			break;
 		}
 		spin_lock_irqsave(&m->lock, flags);
-		dirty_status = m->dirty;
-		dirty_status.size = sizeof(dirty_status);
-		dirty_status.version = CMDP_MONITOR_VERSION;
-		dirty_status.now_ns = ktime_get_ns();
-		dirty_status.metadata_bytes = m->status.history_entries * sizeof(*h);
+		data.dirty_status = m->dirty;
+		data.dirty_status.size = sizeof(data.dirty_status);
+		data.dirty_status.version = CMDP_MONITOR_VERSION;
+		data.dirty_status.now_ns = ktime_get_ns();
+		data.dirty_status.metadata_bytes = m->status.history_entries * sizeof(*h);
 		/* STOP invalidates the session observation contract immediately,
 		 * without a potentially unbounded walk of never-ARMED histories.
 		 */
 		if (m->status.state >= CMDP_MON_STOPPING)
-			dirty_status.valid_observations = 0;
+			data.dirty_status.valid_observations = 0;
 		spin_unlock_irqrestore(&m->lock, flags);
-		if (copy_to_user(up, &dirty_status, sizeof(dirty_status)))
+		if (copy_to_user(up, &data.dirty_status, sizeof(data.dirty_status)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_DIRTY_PAGE:
-		if (copy_from_user(&dirty_page, up, sizeof(dirty_page))) {
+		if (copy_from_user(&data.dirty_page, up, sizeof(data.dirty_page))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (dirty_page.size != sizeof(dirty_page) ||
-		    dirty_page.version != CMDP_MONITOR_VERSION ||
-		    cmdp_validate_addr(dirty_page.addr)) {
+		if (data.dirty_page.size != sizeof(data.dirty_page) ||
+		    data.dirty_page.version != CMDP_MONITOR_VERSION ||
+		    cmdp_validate_addr(data.dirty_page.addr)) {
 			ret = -EINVAL;
 			break;
 		}
-		h = xa_load(&m->history, dirty_page.addr >> PAGE_SHIFT);
+		h = xa_load(&m->history, data.dirty_page.addr >> PAGE_SHIFT);
 		if (!h) {
 			ret = -ENOENT;
 			break;
 		}
 		spin_lock_irqsave(&m->lock, flags);
-		dirty_page = h->dirty;
-		dirty_page.size = sizeof(dirty_page);
-		dirty_page.version = CMDP_MONITOR_VERSION;
+		data.dirty_page = h->dirty;
+		data.dirty_page.size = sizeof(data.dirty_page);
+		data.dirty_page.version = CMDP_MONITOR_VERSION;
 		if (m->status.state >= CMDP_MON_STOPPING)
-			dirty_page.valid = 0;
+			data.dirty_page.valid = 0;
 		spin_unlock_irqrestore(&m->lock, flags);
-		if (copy_to_user(up, &dirty_page, sizeof(dirty_page)))
+		if (copy_to_user(up, &data.dirty_page, sizeof(data.dirty_page)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_START:
@@ -2301,101 +2304,105 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			cmdp_monitor_stop(m, CMDP_MON_ERROR);
 		return ret;
 	case CMDP_MON_STATUS:
-		if (copy_from_user(&status, up, sizeof(status))) {
+		if (copy_from_user(&data.status, up, sizeof(data.status))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (status.size != sizeof(status) || status.version != CMDP_MONITOR_VERSION) {
+		if (data.status.size != sizeof(data.status) ||
+		    data.status.version != CMDP_MONITOR_VERSION) {
 			ret = -EINVAL;
 			break;
 		}
 		spin_lock_irqsave(&m->lock, flags);
 		cmdp_monitor_account(m, ktime_get_ns());
-		status = m->status;
-		status.size = sizeof(status);
-		status.version = CMDP_MONITOR_VERSION;
-		status.now_ns = ktime_get_ns();
+		data.status = m->status;
+		data.status.size = sizeof(data.status);
+		data.status.version = CMDP_MONITOR_VERSION;
+		data.status.now_ns = ktime_get_ns();
 		if (m->current_cohort)
-			status.last_pass = m->current_cohort->report;
+			data.status.last_pass = m->current_cohort->report;
 		spin_unlock_irqrestore(&m->lock, flags);
-		if (copy_to_user(up, &status, sizeof(status)))
+		if (copy_to_user(up, &data.status, sizeof(data.status)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_PROGRESS:
-		if (copy_from_user(&progress, up, sizeof(progress))) {
+		if (copy_from_user(&data.progress, up, sizeof(data.progress))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (progress.size != sizeof(progress) ||
-		    progress.version != CMDP_MONITOR_VERSION || progress.reserved) {
+		if (data.progress.size != sizeof(data.progress) ||
+		    data.progress.version != CMDP_MONITOR_VERSION || data.progress.reserved) {
 			ret = -EINVAL;
 			break;
 		}
 		spin_lock_irqsave(&m->lock, flags);
-		progress = m->progress;
-		progress.size = sizeof(progress);
-		progress.version = CMDP_MONITOR_VERSION;
-		progress.now_ns = ktime_get_ns();
-		if (progress.scan_phase == CMDP_MON_SCAN_WAIT_MMAP)
-			progress.scan_lock_wait_ns = progress.now_ns - progress.phase_since_ns;
+		data.progress = m->progress;
+		data.progress.size = sizeof(data.progress);
+		data.progress.version = CMDP_MONITOR_VERSION;
+		data.progress.now_ns = ktime_get_ns();
+		if (data.progress.scan_phase == CMDP_MON_SCAN_WAIT_MMAP)
+			data.progress.scan_lock_wait_ns =
+				data.progress.now_ns - data.progress.phase_since_ns;
 		spin_unlock_irqrestore(&m->lock, flags);
 		if (m->session) {
 			struct cmdp_session *s = m->session;
 
 			spin_lock_irqsave(&s->address_lock, flags);
-			progress.lookup_calls = s->lookup_calls;
-			progress.lookup_nodes = s->lookup_nodes;
-			progress.lookup_max_nodes = s->lookup_max_nodes;
-			progress.index_lock_max_ns = s->index_lock_max_ns;
-			progress.write_calls = s->write_calls;
-			progress.write_ns = s->write_ns;
-			progress.write_max_ns = s->write_max_ns;
+			data.progress.lookup_calls = s->lookup_calls;
+			data.progress.lookup_nodes = s->lookup_nodes;
+			data.progress.lookup_max_nodes = s->lookup_max_nodes;
+			data.progress.index_lock_max_ns = s->index_lock_max_ns;
+			data.progress.write_calls = s->write_calls;
+			data.progress.write_ns = s->write_ns;
+			data.progress.write_max_ns = s->write_max_ns;
 			spin_unlock_irqrestore(&s->address_lock, flags);
 		}
-		if (copy_to_user(up, &progress, sizeof(progress)))
+		if (copy_to_user(up, &data.progress, sizeof(data.progress)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_PAGE:
-		if (copy_from_user(&page, up, sizeof(page))) {
+		if (copy_from_user(&data.page, up, sizeof(data.page))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (page.size != sizeof(page) || page.version != CMDP_MONITOR_VERSION ||
-		    cmdp_validate_addr(page.addr)) {
+		if (data.page.size != sizeof(data.page) ||
+		    data.page.version != CMDP_MONITOR_VERSION ||
+		    cmdp_validate_addr(data.page.addr)) {
 			ret = -EINVAL;
 			break;
 		}
-		h = xa_load(&m->history, page.addr >> PAGE_SHIFT);
+		h = xa_load(&m->history, data.page.addr >> PAGE_SHIFT);
 		if (!h) {
 			ret = -ENOENT;
 			break;
 		}
 		spin_lock_irqsave(&m->lock, flags);
-		page = h->page;
-		page.size = sizeof(page);
-		page.version = CMDP_MONITOR_VERSION;
+		data.page = h->page;
+		data.page.size = sizeof(data.page);
+		data.page.version = CMDP_MONITOR_VERSION;
 		spin_unlock_irqrestore(&m->lock, flags);
-		if (copy_to_user(up, &page, sizeof(page)))
+		if (copy_to_user(up, &data.page, sizeof(data.page)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_COHORT:
-		if (copy_from_user(&cohort, up, sizeof(cohort))) {
+		if (copy_from_user(&data.cohort, up, sizeof(data.cohort))) {
 			ret = -EFAULT;
 			break;
 		}
-		if (cohort.size != sizeof(cohort) || cohort.version != CMDP_MONITOR_VERSION) {
+		if (data.cohort.size != sizeof(data.cohort) ||
+		    data.cohort.version != CMDP_MONITOR_VERSION) {
 			ret = -EINVAL;
 			break;
 		}
-		c = xa_load(&m->cohorts, cohort.pass_id);
+		c = xa_load(&m->cohorts, data.cohort.pass_id);
 		if (!c) {
 			ret = -ENOENT;
 			break;
 		}
 		spin_lock_irqsave(&m->lock, flags);
-		cohort.pass = c->report;
+		data.cohort.pass = c->report;
 		spin_unlock_irqrestore(&m->lock, flags);
-		if (copy_to_user(up, &cohort, sizeof(cohort)))
+		if (copy_to_user(up, &data.cohort, sizeof(data.cohort)))
 			ret = -EFAULT;
 		break;
 	default:
