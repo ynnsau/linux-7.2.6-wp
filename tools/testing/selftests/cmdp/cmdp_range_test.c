@@ -201,6 +201,77 @@ static bool conserved(const struct cmdp_monitor_status *s)
 	for (int i = 0; i < CMDP_MON_NR_REASONS; i++) terminals += s->terminals[i];
 	return s->first_arms + s->rearms == s->active + terminals;
 }
+static bool setup_complete(const struct cmdp_monitor_status *s)
+{
+	return s->state == CMDP_MON_ATTACHED && s->last_pass.complete &&
+		!s->last_pass.error && s->passes_started == s->passes_completed &&
+		s->last_pass.id == s->passes_completed && !s->resource_failures && conserved(s);
+}
+static bool arm_fixture(struct cmdp_monitor_status *before, struct cmdp_monitor_progress *p0)
+{
+	static const char *const skip_names[] = { "vma", "thp_policy", "nonresident", "page_type",
+		"busy", "aliases", "pins", "resource", "other", "swapped" };
+	_Static_assert(sizeof(skip_names) / sizeof(skip_names[0]) == CMDP_MON_NR_SKIPS,
+		       "setup skip names must match the UAPI");
+	unsigned long populated = prefix + (empty ? 0 : victims);
+	/* The first scan already ran. Two bounded retries allow documented
+	 * best-effort eligibility skips to settle, but never relax the required
+	 * fully ARMED fixture before the measured range operation.
+	 */
+	for (unsigned int attempt = 1; attempt <= 3; attempt++) {
+		printf("# setup attempt=%u pass=%" PRIu64 " complete=%u error=%d "
+		       "started=%" PRIu64 " completed=%" PRIu64 " active=%" PRIu64
+		       " resource_failures=%" PRIu64 " conserved=%u skips=",
+		       attempt, (uint64_t)before->last_pass.id, before->last_pass.complete,
+		       before->last_pass.error, (uint64_t)before->passes_started,
+		       (uint64_t)before->passes_completed, (uint64_t)before->active,
+		       (uint64_t)before->resource_failures, conserved(before));
+		for (unsigned int i = 0; i < CMDP_MON_NR_SKIPS; i++)
+			printf("%s%s:%" PRIu64, i ? "," : "", skip_names[i],
+			       (uint64_t)before->last_pass.skipped[i]);
+		putchar('\n');
+		if (!setup_complete(before)) { errno = 0; return false; }
+		unsigned long missing = 0;
+		int first_query_errno = 0;
+		for (unsigned long i = 0; i < populated; i++) {
+			struct cmdp_monitor_page page;
+			INIT(page); page.addr = base + i * PAGE;
+			errno = 0;
+			int query_rc = ioctl(monitor_fd, CMDP_MON_PAGE, &page);
+			int query_errno = query_rc ? errno : 0;
+			if (!query_rc && page.state == CMDP_MON_PAGE_ARMED) continue;
+			if (!first_query_errno && query_errno) first_query_errno = query_errno;
+			if (missing < 8)
+				printf("# setup_missing attempt=%u index=%lu addr=0x%" PRIx64
+				       " query_rc=%d errno=%d state=%u reason=%u terminal_ns=%" PRIu64
+				       " lifetime=%" PRIu64 " generation=%" PRIu64 "\n",
+				       attempt, i, (uint64_t)page.addr, query_rc, query_errno,
+				       page.state, page.reason, (uint64_t)page.terminal_ns,
+				       (uint64_t)page.lifetime_id, (uint64_t)page.arm_generation);
+			missing++;
+		}
+		printf("# setup_population attempt=%u populated=%lu armed=%lu missing=%lu\n",
+		       attempt, populated, populated - missing, missing);
+		if (!missing) {
+			/* Exclude all setup retries and readiness queries from the
+			 * subsequent invalidation/timing measurement baseline.
+			 */
+			errno = 0;
+			return status(before) && progress(p0) && setup_complete(before);
+		}
+		if (attempt == 3) { errno = first_query_errno; return false; }
+		usleep(10000);
+		errno = 0;
+		int scan_rc = ioctl(monitor_fd, CMDP_MON_SCAN_ONCE);
+		if (scan_rc || !status(before) || !progress(p0)) {
+			int saved_errno = errno;
+			printf("# setup_retry attempt=%u scan_rc=%d errno=%d\n",
+			       attempt + 1, scan_rc, saved_errno);
+			errno = saved_errno; return false;
+		}
+	}
+	return false;
+}
 static bool balanced(void)
 {
 	FILE *f = fopen("/sys/kernel/debug/cmdp/stats", "r");
@@ -383,10 +454,7 @@ int main(int argc, char **argv)
 	struct cmdp_monitor_progress p0, p1;
 	CHECK(status(&before) && progress(&p0) && conserved(&before) &&
 	      !before.resource_failures, "initial accounting and progress available");
-	bool armed = true;
-	for (unsigned long i = 0; i < prefix + (empty ? 0 : victims); i++)
-		if (!page_state(base + i * PAGE, CMDP_MON_PAGE_ARMED)) { armed = false; break; }
-	CHECK(armed, "every populated fixture page is armed before the operation");
+	CHECK(arm_fixture(&before, &p0), "every populated fixture page is armed before the operation");
 	if (stop_wait) {
 		pthread_t holder, stopper; int hold_rc = -1, stop_rc = -1;
 		CHECK(!pthread_create(&holder, NULL, hold_mmap, &hold_rc), "bounded test reader starts");
