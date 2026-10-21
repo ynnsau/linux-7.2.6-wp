@@ -29,6 +29,7 @@
 #endif
 
 static volatile sig_atomic_t interrupted;
+static unsigned int dirty_mode;
 static const char *const reasons[] = { "none", "write", "invalidate", "control_stop",
 	"target_exit", "exec", "fork", "error", "thp_change", "scope_change" };
 static const char *const skips[] = { "vma", "thp_policy", "nonresident", "page_type",
@@ -79,6 +80,30 @@ static void pass_json(const char *event, const struct cmdp_monitor_pass *p)
 	puts("}}");
 	funlockfile(stdout);
 }
+static int dirty_status_read(int fd)
+{
+	struct cmdp_monitor_dirty_status d;
+	INIT_REQ(d);
+	if (ioctl(fd, CMDP_MON_DIRTY_STATUS, &d)) {
+		if (errno == ENOTTY && !dirty_mode) return 0;
+		return -1;
+	}
+	flockfile(stdout);
+	printf("{\"event\":\"dirty_status\",\"now_ns\":%llu,\"mode\":%u,\"quiet_ms\":%u,"
+	       "\"passes_started\":%llu,\"passes_completed\":%llu,\"samples\":%llu,"
+	       "\"dirty\":%llu,\"clean\":%llu,\"primed\":%llu,\"unknown\":%llu,"
+	       "\"qualified\":%llu,\"late_dirty\":%llu,\"resets\":%llu,\"flushes\":%llu,"
+	       "\"reset_ns\":%llu,\"flush_ns\":%llu,\"sample_ns\":%llu,"
+	       "\"invalidations\":%llu,\"wp_resets\":%llu,\"resource_skips\":%llu,"
+	       "\"valid_observations\":%llu,\"metadata_bytes\":%llu}\n",
+	       d.now_ns, d.mode, d.quiet_ms, d.passes_started, d.passes_completed,
+	       d.samples, d.dirty, d.clean, d.primed, d.unknown, d.qualified,
+	       d.late_dirty, d.resets, d.flushes, d.reset_ns, d.flush_ns, d.sample_ns,
+	       d.invalidations, d.wp_resets, d.resource_skips, d.valid_observations,
+	       d.metadata_bytes);
+	funlockfile(stdout);
+	return 0;
+}
 static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 {
 	INIT_REQ(*s);
@@ -103,7 +128,7 @@ static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 		printf("%s\"%s\":%llu", i ? "," : "", reason(i), s->terminals[i]);
 	puts("}}");
 	funlockfile(stdout);
-	return 0;
+	return dirty_status_read(fd);
 }
 
 static const char *scan_phase(unsigned int n)
@@ -231,6 +256,9 @@ static void usage(const char *name)
 		"  --duration-sec N  stop monitoring after N seconds\n"
 		"  --once            one synchronous sweep, then stop\n"
 		"  --inventory       scan-only session; do not ARM\n"
+		"  --dirty-observe   sample hardware dirty bits; never ARM\n"
+		"  --dirty-qualify   ARM only after a valid quiet interval\n"
+		"  --quiet-ms N      required quiet interval (default 10000, minimum 10)\n"
 		"  --max-pages N     active-page bound (default 8388608)\n"
 		"  --max-history N   address-history bound (default 8388608)\n"
 		"  --poll-ms N       reporting interval (default 1000)\n"
@@ -245,6 +273,8 @@ int main(int argc, char **argv)
 		{ "sweeps", 1, 0, 'n' }, { "duration-sec", 1, 0, 'd' },
 		{ "once", 0, 0, '1' }, { "inventory", 0, 0, 's' },
 		{ "max-pages", 1, 0, 'm' }, { "max-history", 1, 0, 'H' },
+		{ "dirty-observe", 0, 0, 'o' }, { "dirty-qualify", 0, 0, 'q' },
+		{ "quiet-ms", 1, 0, 'Q' },
 		{ "poll-ms", 1, 0, 'P' }, { "help", 0, 0, 'h' }, { 0 }
 	};
 	struct cmdp_monitor_attach a;
@@ -256,7 +286,9 @@ int main(int argc, char **argv)
 	uint64_t launch_ns = 0, exec_ack_ns = 0;
 	pid_t pid = 0;
 	int fd = -1, pidfd = -1, result = 1, opt, poll_ms = 1000;
-	bool own = false, once = false, attached = false;
+	bool own = false, once = false, attached = false, quiet_set = false;
+	struct cmdp_monitor_dirty_config dirty_config;
+	INIT_REQ(dirty_config);
 	while ((opt = getopt_long(argc, argv, "+", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': pid = (pid_t)number(optarg, INT_MAX); break;
@@ -265,6 +297,12 @@ int main(int argc, char **argv)
 		case 'd': seconds = number(optarg, 86400 * 365); break;
 		case '1': once = true; break;
 		case 's': a.flags |= CMDP_MONITOR_F_SCAN_ONLY; break;
+		case 'o':
+		case 'q':
+			if (dirty_mode) { fprintf(stderr, "choose one dirty mode\n"); return 2; }
+			dirty_mode = opt == 'o' ? CMDP_MON_DIRTY_OBSERVE : CMDP_MON_DIRTY_QUALIFY;
+			break;
+		case 'Q': dirty_config.quiet_ms = number(optarg, UINT32_MAX); quiet_set = true; break;
 		case 'm': a.max_pages = number(optarg, UINT32_MAX); break;
 		case 'H': a.max_history = number(optarg, UINT32_MAX); break;
 		case 'P': poll_ms = number(optarg, 60000); break;
@@ -272,7 +310,9 @@ int main(int argc, char **argv)
 		default: usage(argv[0]); return 2;
 		}
 	}
-	if (!poll_ms || (pid && optind != argc) || (!pid && optind == argc)) {
+	if (!poll_ms || (pid && optind != argc) || (!pid && optind == argc) ||
+	    (dirty_mode && (a.flags & CMDP_MONITOR_F_SCAN_ONLY)) ||
+	    (quiet_set && (!dirty_mode || dirty_config.quiet_ms < 10))) {
 		usage(argv[0]); return 2;
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -294,6 +334,10 @@ int main(int argc, char **argv)
 	a.pidfd = pidfd;
 	if (ioctl(fd, CMDP_MON_ATTACH, &a)) { perror("CMDP_MON_ATTACH"); goto out; }
 	attached = true;
+	if (dirty_mode) {
+		dirty_config.mode = dirty_mode;
+		if (ioctl(fd, CMDP_MON_DIRTY_CONFIG, &dirty_config)) { perror("CMDP_MON_DIRTY_CONFIG"); goto out; }
+	}
 	printf("{\"event\":\"controller\",\"pid\":%d,\"launched\":%s,\"thp_disabled_before_exec\":%s,\"version\":%u,\"launch_ns\":%" PRIu64 ",\"exec_ack_ns\":%" PRIu64 "}\n",
 	       pid, own ? "true" : "false", own ? "true" : "false", CMDP_MONITOR_VERSION, launch_ns, exec_ack_ns);
 	uint64_t begin = now_ns();

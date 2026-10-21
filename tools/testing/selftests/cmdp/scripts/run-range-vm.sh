@@ -1,11 +1,11 @@
 #!/bin/bash
 # No host kernel installation, host CMD-P workload, disk passthrough, or network.
 set -euo pipefail
-kernel=${1:?Usage: run-range-vm.sh KERNEL INITRAMFS NEW_RUN_DIR small|scale|numa}
+kernel=${1:?Usage: run-range-vm.sh KERNEL INITRAMFS NEW_RUN_DIR small|scale|numa|dirty}
 initrd=${2:?initramfs required}
 out=${3:?new run directory required}
 suite=${4:-small}
-case "$suite" in small|scale|numa) ;; *) exit 2;; esac
+case "$suite" in small|scale|numa|dirty) ;; *) exit 2;; esac
 test ! -e "$out" || { echo "Refusing existing run directory: $out" >&2; exit 2; }
 test -r "$kernel" && test -r "$initrd" && test -r /dev/kvm && test -w /dev/kvm
 qemu=${QEMU:-qemu-system-x86_64}
@@ -25,14 +25,21 @@ for key in entries managed isolated; do
     test "$(awk -v key="$key" '$1==key {print $2}' "$out/host-cmdp.before")" = 0
 done
 date -u +%FT%TZ > "$out/started-at"
+extra_kernel_args=
+if test "$suite" = dirty; then extra_kernel_args=' cmdp_disposable_swap=1'; fi
 args=( -enable-kvm -cpu host -smp 4,sockets=2,cores=2,threads=1 -m 16384
     -object memory-backend-ram,id=ram0,size=8G
     -object memory-backend-ram,id=ram1,size=8G
     -numa node,nodeid=0,cpus=0-1,memdev=ram0
     -numa node,nodeid=1,cpus=2-3,memdev=ram1
     -kernel "$kernel" -initrd "$initrd"
-    -append "console=ttyS0 rdinit=/init panic=-1 oops=panic cmdp_suite=$suite"
+    -append "console=ttyS0 rdinit=/init panic=-1 oops=panic cmdp_suite=$suite$extra_kernel_args"
     -nodefaults -display none -serial stdio -monitor none -no-reboot -net none )
+if test "$suite" = dirty; then
+    # Fresh regular file owned by this run; never pass through a host disk.
+    truncate -s 256M "$out/swap.img"
+    args+=( -drive "file=$out/swap.img,format=raw,if=virtio,cache=none" )
+fi
 printf '%q ' "$qemu" "${args[@]}" > "$out/qemu-command.txt"
 printf '\n' >> "$out/qemu-command.txt"
 set +e

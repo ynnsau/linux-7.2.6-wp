@@ -141,4 +141,52 @@ struct cmdp_monitor_test_hold {
 #define CMDP_MON_PROGRESS _IOWR(CMDP_IOC_MAGIC, 23, struct cmdp_monitor_progress)
 #define CMDP_MON_TEST_HOLD_MMAP _IOW(CMDP_IOC_MAGIC, 24, struct cmdp_monitor_test_hold)
 
+/* Optional hardware-dirty observation. Configure after ATTACH, before any scan.
+ * Existing status/pass/page ABI and unconditional ARM default are unchanged.
+ * OBSERVE never arms; QUALIFY requires quiet_ms since a synchronized reset.
+ */
+enum cmdp_monitor_dirty_mode {
+	CMDP_MON_DIRTY_DISABLED, CMDP_MON_DIRTY_OBSERVE, CMDP_MON_DIRTY_QUALIFY,
+};
+struct cmdp_monitor_dirty_config {
+	__u32 size, version, mode, quiet_ms; /* 0 selects 10000; minimum 10. */
+	__u64 reserved[2];
+};
+/* All counters are cumulative. samples = dirty + clean counts successful
+ * eligible PTE observations; priming visits also count in dirty/clean.
+ * qualified counts first threshold crossings per observation epoch, including
+ * OBSERVE mode (which does not ARM). unknown includes unsupported/busy probes
+ * and unavailable history; late_dirty is a final-admission rejection.
+ * reset_ns/flush_ns are subsets of sample_ns, all monotonic nanoseconds.
+ * valid_observations counts retained OFF epochs, not pages proven clean now;
+ * it becomes zero at STOP. metadata_bytes includes the complete history
+ * objects, not XArray/cohort allocator overhead. Samples never expand the
+ * existing supported CPU-writer contract to arbitrary kernel/DMA writers.
+ */
+struct cmdp_monitor_dirty_status {
+	__u32 size, version, mode, quiet_ms;
+	__u64 now_ns, passes_started, passes_completed;
+	__u64 samples, dirty, clean, primed, unknown, qualified, late_dirty;
+	__u64 resets, flushes, reset_ns, flush_ns, sample_ns;
+	__u64 invalidations, wp_resets, resource_skips, valid_observations;
+	__u64 metadata_bytes;
+};
+/* Counters persist across epochs. epoch_id increments after every reset and
+ * synchronous TLB flush; quiet_since_ns begins after that boundary.
+ * valid describes uninterrupted observation, not the current hardware D bit.
+ * It is zero after ARM, invalidation, uncertain observation, or STOP; old
+ * timestamps remain available. qualified_ns is the first Q crossing in this
+ * epoch, cleared on the next reset. A first visit always primes, never arms.
+ */
+struct cmdp_monitor_dirty_page {
+	__u32 size, version;
+	__u64 addr; /* Input: page-aligned target virtual address. */
+	__u64 pfn, epoch_id, quiet_since_ns, last_sample_ns, last_dirty_ns;
+	__u64 samples, dirty, resets, qualified_ns;
+	__u32 valid, last_dirty;
+};
+#define CMDP_MON_DIRTY_CONFIG _IOW(CMDP_IOC_MAGIC, 25, struct cmdp_monitor_dirty_config)
+#define CMDP_MON_DIRTY_STATUS _IOWR(CMDP_IOC_MAGIC, 26, struct cmdp_monitor_dirty_status)
+#define CMDP_MON_DIRTY_PAGE _IOWR(CMDP_IOC_MAGIC, 27, struct cmdp_monitor_dirty_page)
+
 #endif /* _UAPI_LINUX_CMDP_H */

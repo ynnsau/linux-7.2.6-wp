@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Extract complete range/dirty VM evidence and validate counters and workloads."""
+import argparse, hashlib, importlib.util, json, pathlib, re, sys
+
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('run', type=pathlib.Path)
+p.add_argument('--scripts-dir', type=pathlib.Path, required=True)
+a=p.parse_args()
+run=a.run
+raw=(run/'serial.log').read_bytes()
+lines=raw.decode('utf-8',errors='replace').splitlines()
+errors=[]
+def require(ok, message):
+    if not ok: errors.append(message)
+require((run/'qemu.exit').read_text().strip()=='0','QEMU exit is not zero')
+require(sum(x.strip()=='CMDP_RANGE_VM_START' for x in lines)==1,'Missing/ambiguous VM start')
+require(sum(x.strip()=='CMDP_RANGE_VM_RESULT=0' for x in lines)==1,'Missing/ambiguous passing VM result')
+for item in ('host-boot-id','host-uname','host-cmdp'):
+    require((run/(item+'.before')).read_bytes()==(run/(item+'.after')).read_bytes(), item+' changed')
+bad=re.compile(r'BUG:|WARNING:|Oops:|KASAN:|Kernel panic|possible circular locking|inconsistent lock state|general protection fault|CMDP_CONSOLE_DRAIN_FAILED|^not ok ')
+warnings=[x for x in lines if bad.search(x)]
+require(not warnings,'Guest warning/failure signature')
+# Every TAP suite must have an explicit, complete sequence and nonzero plan.
+taps=[]; tap=None
+for line in lines:
+    v=line.strip()
+    if v=='TAP version 13':
+        tap={'checks':[], 'plans':[], 'failures':[]}; taps.append(tap)
+    elif tap is not None:
+        plan=re.fullmatch(r'1\.\.([0-9]+)(?:\s+#.*)?',v)
+        check=re.match(r'^(not ok|ok)\s+([0-9]+)\b',v)
+        if plan: tap['plans'].append(int(plan.group(1)))
+        if check:
+            tap['checks'].append(int(check.group(2)))
+            if check.group(1)=='not ok': tap['failures'].append(v)
+for t in taps:
+    n=t['plans'][0] if len(t['plans'])==1 else 0
+    t['pass']=bool(n and t['checks']==list(range(1,n+1)) and not t['failures'])
+    t['planned']=n; t['observed']=len(t.pop('checks'))
+require(bool(taps) and all(t['pass'] for t in taps),'Incomplete/failing TAP suite')
+# Parse bounded report blocks; tolerate workload stderr mixed with JSON stdout.
+blocks={}; active=None; previous=None
+for line in lines:
+    v=line.strip()
+    b=re.fullmatch(r'CMDP_REPORT_BEGIN ([A-Za-z0-9_-]+)',v)
+    e=re.fullmatch(r'CMDP_REPORT_END ([A-Za-z0-9_-]+) result=(-?[0-9]+)',v)
+    if b:
+        name=b.group(1)
+        require(active is None and name not in blocks,'Nested/duplicate report block '+name)
+        blocks[name]={'json':[], 'target':[], 'exit':None}; active=name; previous=None
+    elif e:
+        require(active==e.group(1),'Mismatched report end '+e.group(1))
+        if active:
+            blocks[active]['exit']=int(e.group(2)); previous=active
+        active=None
+    elif active:
+        blocks[active]['json' if v.startswith('{') else 'target'].append(line)
+    elif previous:
+        blocks[previous]['target'].append(line)
+require(active is None,'Unclosed report block')
+spec=importlib.util.spec_from_file_location('validate_run',str(a.scripts_dir/'validate-run.py'))
+validator=importlib.util.module_from_spec(spec); spec.loader.exec_module(validator)
+report_root=run/'reports'
+report_root.mkdir(exist_ok=True)
+workloads={}
+for name, block in blocks.items():
+    out=report_root/name; out.mkdir(exist_ok=True)
+    (out/'monitor.jsonl').write_text('\n'.join(block['json'])+'\n')
+    target='\n'.join(block['target'])+'\n'; (out/'target.log').write_text(target)
+    result=validator.validate(out, minimum=1)
+    local_errors=list(result['errors'])
+    if block['exit']!=0: local_errors.append('Controller block exit is not zero')
+    if 'bfs' in name:
+        marks=re.findall(r'Verification:\s*(PASS|FAIL)',target)
+        trials=re.findall(r'Trial Time:\s*[0-9.eE+-]+',target)
+        if marks!=['PASS']*8 or len(trials)!=8: local_errors.append('Expected exactly 8 verified BFS trials')
+        result['bfs_verifications']=len(marks); result['bfs_trials']=len(trials)
+    if name in ('hotcold','concurrent','churn'):
+        if re.findall(r'fixture_validation=(PASS|FAIL)',target)!=['PASS']:
+            local_errors.append('Expected one fixture validation PASS')
+    result['errors']=local_errors; result['pass']=not local_errors
+    (out/'validation.json').write_text(json.dumps(result,indent=2)+'\n')
+    workloads[name]=result
+    require(result['pass'],'Workload failed: '+name)
+suite_match=re.search(r'cmdp_suite=([^ "\\]+)',(run/'qemu-command.txt').read_text())
+suite=suite_match.group(1) if suite_match else 'unknown'
+if suite=='dirty':
+    require(set(blocks)=={'observe-bfs1','observe-bfs4','qualify-bfs1','qualify-bfs4'},'Missing dirty BFS mode/thread blocks')
+    require(len(taps)==5 and taps[0]['planned']==18 and taps[1]['planned']==59 and taps[-1]['planned']>=80,'Unexpected dirty regression TAP suites')
+    require(sum(x.strip()=='CMDP_DIRTY_SWAP_READY' for x in lines)==1,'Swap was not enabled')
+    require(sum(x.strip()=='CMDP_DIRTY_SWAP_DRAINED' for x in lines)==1,'Swap was not drained')
+    require(any(re.search(r'^# swapped anonymous pages=[1-9][0-9]* ',x) for x in lines),'No actual swapout evidence')
+elif suite=='small':
+    require(set(blocks)=={'hotcold','concurrent','churn','bfs'},'Missing small workload blocks')
+    require(len(taps)>=2 and taps[0]['planned']==18 and taps[1]['planned']==59,'Missing legacy regression tests')
+stats={}
+for line in lines:
+    m=re.fullmatch(r'(arms|publishes|revokes|waiters|rejects|entries|managed|isolated|stale|arm_ns|revoke_ns)\s+([0-9]+)',line.strip())
+    if m: stats[m.group(1)]=int(m.group(2))
+for key in ('entries','managed','isolated'): require(stats.get(key)==0,'Final '+key+' is not zero')
+summary={'pass':not errors,'suite':suite,'errors':errors,'tap_suites':taps,'workloads':workloads,'global_stats':stats,'warning_signatures':warnings,'serial_sha256':hashlib.sha256(raw).hexdigest()}
+(run/'validation.json').write_text(json.dumps(summary,indent=2)+'\n')
+print(json.dumps({'run':str(run),'suite':suite,'pass':summary['pass'],'tap_checks':[t['planned'] for t in taps],'workloads':list(workloads),'errors':errors}))
+sys.exit(0 if summary['pass'] else 1)

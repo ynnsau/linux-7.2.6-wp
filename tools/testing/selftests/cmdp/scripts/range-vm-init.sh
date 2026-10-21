@@ -46,6 +46,9 @@ test -w /proc/sys/kernel/numa_balancing || rc=1
 test "$rc" = 0 || finish
 echo 0 > /proc/sys/kernel/numa_balancing
 case "$suite" in
+dirty)
+    run /tests/dirty-vm-tests.sh
+    ;;
 small)
     run /tests/cmdp_test
     run /tests/cmdp_monitor_test

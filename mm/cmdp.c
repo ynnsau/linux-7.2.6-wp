@@ -32,6 +32,8 @@
 #include <linux/xarray.h>
 #include <uapi/linux/cmdp.h>
 
+#include <asm/tlbflush.h>
+
 #include "internal.h"
 
 #define CREATE_TRACE_POINTS
@@ -129,6 +131,8 @@ static struct cmdp_session *cmdp_owner;
 #define CMDP_MON_MAX_PAGES (16U * 1024 * 1024)
 struct cmdp_history {
 	struct cmdp_monitor_page page;
+	struct cmdp_monitor_dirty_page dirty;
+	u64 observation_seq;
 	bool continuous;
 };
 struct cmdp_cohort {
@@ -145,6 +149,7 @@ struct cmdp_monitor {
 	struct xarray cohorts;
 	struct cmdp_monitor_status status;
 	struct cmdp_monitor_progress progress;
+	struct cmdp_monitor_dirty_status dirty;
 	struct cmdp_cohort *current_cohort;
 	u64 next_lifetime;
 	u64 account_ns;
@@ -160,6 +165,9 @@ static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
 		unsigned long start, unsigned long end);
 static void cmdp_monitor_mark_stop(struct cmdp_monitor *m, unsigned int reason);
 static void cmdp_monitor_snapshot_stop(struct cmdp_monitor *m);
+static void cmdp_dirty_invalidate_locked(struct cmdp_monitor *m,
+		struct cmdp_history *h);
+static bool cmdp_dirty_admit(struct cmdp_entry *e, pte_t pte);
 static struct page *cmdp_monitor_get_page(struct vm_area_struct *vma,
 		unsigned long addr, bool *resident, int *skip);
 
@@ -576,7 +584,8 @@ static bool cmdp_vma_supported(struct vm_area_struct *vma)
 	return vma_is_anonymous(vma) && !vma->vm_file &&
 		(vma->vm_flags & VM_WRITE) &&
 		!(vma->vm_flags & (VM_SHARED | VM_MAYSHARE | VM_HUGETLB |
-			VM_PFNMAP | VM_MIXEDMAP | VM_IO | VM_MERGEABLE)) &&
+			VM_PFNMAP | VM_MIXEDMAP | VM_IO | VM_MERGEABLE |
+			VM_SHADOW_STACK)) &&
 		!userfaultfd_armed(vma) &&
 		(!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) ||
 		 ((vma->vm_flags & VM_NOHUGEPAGE) ||
@@ -631,6 +640,13 @@ static int cmdp_protect_alias(struct cmdp_entry *e, struct cmdp_alias *alias)
 		goto unlock;
 	pte = ptep_get(pvmw.pte);
 	if (!pte_present(pte) || vm_normal_page(vma, alias->addr, pte) != e->page)
+		goto unlock;
+
+	/* Last dirty check is under PTL, immediately before protection. A write
+	 * after this check is still safe: the existing ARM flush/ownership
+	 * protocol applies, and its later write will revoke protection.
+	 */
+	if (!cmdp_dirty_admit(e, pte))
 		goto unlock;
 
 	/* Atomic clear preserves hardware A/D updates; flush before reinstall. */
@@ -1155,6 +1171,50 @@ static void cmdp_monitor_snapshot_stop(struct cmdp_monitor *m)
 	spin_unlock_irqrestore(&m->lock, flags);
 }
 
+/* m->lock protects observation state, including never-ARMED histories. */
+static void cmdp_dirty_invalidate_locked(struct cmdp_monitor *m,
+		struct cmdp_history *h)
+{
+	if (h->dirty.valid) {
+		h->dirty.valid = 0;
+		m->dirty.valid_observations--;
+	}
+	h->observation_seq++;
+}
+
+/* Ordinary RW only: pte_write() also accepts CET shadow-stack encodings. */
+static bool cmdp_dirty_pte_supported(pte_t pte)
+{
+	return pte_present(pte) && !pte_protnone(pte) &&
+		(pte_flags(pte) & _PAGE_RW) &&
+		!(pte_flags(pte) & _PAGE_SAVED_DIRTY);
+}
+
+static bool cmdp_dirty_admit(struct cmdp_entry *e, pte_t pte)
+{
+	struct cmdp_monitor *m = e->session->monitor;
+	struct cmdp_history *h = e->history;
+	unsigned long flags;
+	bool admit;
+
+	if (!m || m->dirty.mode != CMDP_MON_DIRTY_QUALIFY)
+		return true;
+	spin_lock_irqsave(&m->lock, flags);
+	admit = h && h->dirty.valid && h->dirty.pfn == e->pfn &&
+		h->dirty.qualified_ns && cmdp_dirty_pte_supported(pte) &&
+		!pte_dirty(pte);
+	if (!admit && h) {
+		if (pte_dirty(pte)) {
+			m->dirty.late_dirty++;
+			h->dirty.last_dirty_ns = ktime_get_ns();
+			h->dirty.last_dirty = 1;
+		}
+		cmdp_dirty_invalidate_locked(m, h);
+	}
+	spin_unlock_irqrestore(&m->lock, flags);
+	return admit;
+}
+
 static void cmdp_monitor_armed(struct cmdp_entry *e)
 {
 	struct cmdp_monitor *m = e->session->monitor;
@@ -1174,6 +1234,7 @@ static void cmdp_monitor_armed(struct cmdp_entry *e)
 		h->page.arm_count = 0;
 	}
 	h->continuous = true;
+	cmdp_dirty_invalidate_locked(m, h);
 	h->page.pfn = e->pfn;
 	h->page.state = CMDP_MON_PAGE_ARMED;
 	h->page.reason = CMDP_MON_NONE;
@@ -1233,6 +1294,9 @@ static void cmdp_monitor_terminal(struct cmdp_entry *e, const char *why)
 		e->cohort->report.write_revoked++;
 	else
 		e->cohort->report.other_terminal++;
+	cmdp_dirty_invalidate_locked(m, h);
+	if (m->dirty.mode && reason == CMDP_MON_WRITE)
+		m->dirty.wp_resets++;
 	h->page.reason = reason;
 	h->page.terminal_ns = now;
 	h->page.state = reason == CMDP_MON_WRITE ? CMDP_MON_PAGE_OFF_WRITE :
@@ -1259,6 +1323,9 @@ static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
 	xa_for_each_range(&m->history, index, h, start >> PAGE_SHIFT,
 			  (end - 1) >> PAGE_SHIFT) {
 		spin_lock_irqsave(&m->lock, flags);
+		if (h->dirty.valid)
+			m->dirty.invalidations++;
+		cmdp_dirty_invalidate_locked(m, h);
 		if (h->continuous) {
 			h->continuous = false;
 			m->status.history_resets++;
@@ -1452,6 +1519,150 @@ static int cmdp_monitor_probe(struct cmdp_session *s, unsigned long addr,
 	return ret;
 }
 
+/* Return 1 only for a clean, qualified candidate; 0 means keep observing.
+ * CMDP is native X86_64 (!XEN_PV). No generic PTE replacement is used here:
+ * locked bit-test-and-reset preserves A, permissions, PFN and software bits
+ * while hardware can update A/D concurrently. The ordinary RW/saved-dirty
+ * checks above make _PAGE_BIT_DIRTY the sole supported dirty encoding.
+ *
+ * The folio lock excludes reclaim/migration until epoch publication. mmap
+ * write plus vma_start_write excludes mapping changes and per-VMA faults.
+ * The PTL then stabilizes the exact PTE through reset, synchronous shootdown
+ * and publication. An invalidation sequence additionally rejects evidence
+ * disturbed by a notifier. These locks do NOT stop user stores: the reset to
+ * flush-completion interval is deliberately outside the certified window.
+ */
+static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
+		struct vm_area_struct *vma, unsigned long addr, unsigned long pfn,
+		struct cmdp_history *h)
+{
+	struct page *page;
+	struct folio *folio;
+	struct page_vma_mapped_walk pvmw;
+	unsigned long flags;
+	u64 start = ktime_get_ns(), seq, now, reset_ns = 0, flush_ns = 0;
+	bool resident, dirty, reset, valid;
+	int skip, ret = -EAGAIN;
+	pte_t pte;
+
+	mmap_assert_write_locked(vma->vm_mm);
+	vma_start_write(vma);
+	page = cmdp_monitor_get_page(vma, addr, &resident, &skip);
+	if (!page)
+		goto unknown;
+	folio = page_folio(page);
+	if (page_to_pfn(page) != pfn || !folio_trylock(folio))
+		goto put;
+	/* Revalidate the probe after acquiring the folio lock. Do not retain
+	 * page ownership between samples or change LRU/reclaim eligibility.
+	 */
+	if (folio_test_large(folio) || !folio_test_anon(folio) ||
+	    folio_test_ksm(folio) || folio_test_swapcache(folio) ||
+	    PageReserved(page) || is_zone_device_page(page) ||
+	    PageHWPoison(page) || !PageAnonExclusive(page) || PageCmdp(page) ||
+	    folio_mapcount(folio) != 1 || folio_maybe_dma_pinned(folio) ||
+	    folio_ref_count(folio) != folio_expected_ref_count(folio) + 1)
+		goto unlock_folio;
+	pvmw = (struct page_vma_mapped_walk) {
+		.pfn = pfn, .nr_pages = 1, .pgoff = folio_pgoff(folio),
+		.vma = vma, .address = addr, .flags = PVMW_SYNC,
+	};
+	if (!page_vma_mapped_walk(&pvmw))
+		goto unlock_folio;
+	if (!pvmw.pte || pvmw.address != addr)
+		goto unlock_pte;
+	pte = ptep_get(pvmw.pte);
+	if (!cmdp_dirty_pte_supported(pte) ||
+	    vm_normal_page(vma, addr, pte) != page)
+		goto unlock_pte;
+	dirty = pte_dirty(pte);
+	spin_lock_irqsave(&m->lock, flags);
+	seq = h->observation_seq;
+	valid = h->dirty.valid && h->dirty.pfn == pfn;
+	spin_unlock_irqrestore(&m->lock, flags);
+	reset = !valid || dirty;
+	if (reset) {
+		u64 before = ktime_get_ns();
+
+		/* Preserve Linux dirty/reclaim accounting before discarding D.
+		 * Conservative marking also covers a store racing the initial read.
+		 */
+		folio_mark_dirty(folio);
+		dirty |= test_and_clear_bit(_PAGE_BIT_DIRTY,
+					   (unsigned long *)&pvmw.pte->pte);
+		reset_ns = ktime_get_ns() - before;
+		before = ktime_get_ns();
+		/* Required even when the initial D read was zero: an old cached
+		 * dirty translation must not survive into a new observation epoch.
+		 * This also invokes the architecture secondary-TLB notification.
+		 */
+		flush_tlb_page(vma, addr);
+		flush_ns = ktime_get_ns() - before;
+	}
+	now = ktime_get_ns();
+	spin_lock_irqsave(&m->lock, flags);
+	m->dirty.samples++;
+	h->dirty.samples++;
+	h->dirty.last_sample_ns = now;
+	h->dirty.last_dirty = dirty;
+	if (dirty) {
+		m->dirty.dirty++;
+		h->dirty.dirty++;
+		h->dirty.last_dirty_ns = now;
+	} else {
+		m->dirty.clean++;
+	}
+	if (reset) {
+		m->dirty.resets++;
+		m->dirty.flushes++;
+		m->dirty.reset_ns += reset_ns;
+		m->dirty.flush_ns += flush_ns;
+		h->dirty.resets++;
+	}
+	if (seq != h->observation_seq) {
+		cmdp_dirty_invalidate_locked(m, h);
+		m->dirty.unknown++;
+		ret = 0;
+	} else if (reset) {
+		if (!h->dirty.valid)
+			m->dirty.valid_observations++;
+		if (!valid)
+			m->dirty.primed++;
+		h->dirty.valid = 1;
+		h->dirty.pfn = pfn;
+		h->dirty.epoch_id++;
+		h->dirty.quiet_since_ns = now;
+		h->dirty.qualified_ns = 0;
+		ret = 0;
+	} else {
+		ret = now - h->dirty.quiet_since_ns >=
+			(u64)m->dirty.quiet_ms * NSEC_PER_MSEC;
+		if (ret && !h->dirty.qualified_ns) {
+			h->dirty.qualified_ns = now;
+			m->dirty.qualified++;
+		}
+	}
+	m->dirty.sample_ns += ktime_get_ns() - start;
+	spin_unlock_irqrestore(&m->lock, flags);
+	page_vma_mapped_walk_done(&pvmw);
+	folio_unlock(folio);
+	put_page(page);
+	return ret;
+unlock_pte:
+	page_vma_mapped_walk_done(&pvmw);
+unlock_folio:
+	folio_unlock(folio);
+put:
+	put_page(page);
+unknown:
+	spin_lock_irqsave(&m->lock, flags);
+	cmdp_dirty_invalidate_locked(m, h);
+	m->dirty.unknown++;
+	m->dirty.sample_ns += ktime_get_ns() - start;
+	spin_unlock_irqrestore(&m->lock, flags);
+	return ret;
+}
+
 static unsigned int cmdp_monitor_failure(int ret, const char *why)
 {
 	if (ret == -ENOMEM || ret == -ENOSPC)
@@ -1570,6 +1781,8 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 	}
 	spin_lock_irqsave(&m->lock, flags);
 	m->status.passes_started++;
+	if (m->dirty.mode)
+		m->dirty.passes_started++;
 	m->current_cohort = c;
 	spin_unlock_irqrestore(&m->lock, flags);
 	/* Pending allocation/putback batches also own transient references.
@@ -1614,13 +1827,15 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 				skip = vma_is_anonymous(vma) && !vma->vm_file &&
 					!(vma->vm_flags & (VM_SHARED | VM_MAYSHARE |
 					VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP | VM_IO |
-					VM_MERGEABLE)) && !userfaultfd_armed(vma) ?
+					VM_MERGEABLE | VM_SHADOW_STACK)) && !userfaultfd_armed(vma) ?
 					CMDP_MON_SKIP_THP_POLICY : CMDP_MON_SKIP_VMA;
 				spin_lock_irqsave(&m->lock, flags);
 				c->report.writable_pages += pages;
 				c->report.examined_pages += pages;
 				c->report.skipped[skip] += pages;
 				spin_unlock_irqrestore(&m->lock, flags);
+				if (m->dirty.mode)
+					cmdp_monitor_invalidate_history(s, addr, vma->vm_end);
 				addr = vma->vm_end;
 				continue;
 			}
@@ -1634,8 +1849,15 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			else
 				c->report.eligible_pages++;
 			spin_unlock_irqrestore(&m->lock, flags);
-			if (probe >= 0 || (m->status.flags & CMDP_MONITOR_F_SCAN_ONLY))
+			if (probe >= 0 || (m->status.flags & CMDP_MONITOR_F_SCAN_ONLY)) {
+				if (m->dirty.mode) {
+					cmdp_monitor_invalidate_history(s, addr, addr + PAGE_SIZE);
+					spin_lock_irqsave(&m->lock, flags);
+					m->dirty.unknown++;
+					spin_unlock_irqrestore(&m->lock, flags);
+				}
 				goto next;
+			}
 			h = xa_load(&m->history, addr >> PAGE_SHIFT);
 			spin_lock_irqsave(&m->lock, flags);
 			if (h && h->page.state == CMDP_MON_PAGE_ARMED) {
@@ -1643,10 +1865,14 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 				spin_unlock_irqrestore(&m->lock, flags);
 				goto next;
 			}
-			if (m->status.active >= m->max_pages ||
+			if ((!m->dirty.mode && m->status.active >= m->max_pages) ||
 			    (!h && m->status.history_entries >= m->max_history)) {
 				c->report.skipped[CMDP_MON_SKIP_RESOURCE]++;
 				m->status.resource_failures++;
+				if (m->dirty.mode) {
+					m->dirty.resource_skips++;
+					m->dirty.unknown++;
+				}
 				spin_unlock_irqrestore(&m->lock, flags);
 				goto next;
 			}
@@ -1656,6 +1882,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 				if (!h)
 					goto resource;
 				h->page.addr = addr;
+				h->dirty.addr = addr;
 				probe = xa_err(xa_store(&m->history, addr >> PAGE_SHIFT,
 							h, GFP_KERNEL));
 				if (probe) {
@@ -1666,11 +1893,25 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 				m->status.history_entries++;
 				spin_unlock_irqrestore(&m->lock, flags);
 			}
+			if (m->dirty.mode) {
+				probe = cmdp_monitor_sample_dirty(m, vma, addr, pfn, h);
+				if (probe <= 0 || m->dirty.mode == CMDP_MON_DIRTY_OBSERVE)
+					goto next;
+				spin_lock_irqsave(&m->lock, flags);
+				if (m->status.active >= m->max_pages) {
+					cmdp_dirty_invalidate_locked(m, h);
+					spin_unlock_irqrestore(&m->lock, flags);
+					goto resource;
+				}
+				spin_unlock_irqrestore(&m->lock, flags);
+			}
 			why = "allocation";
 			probe = cmdp_arm_locked(s, addr, h, c, &why);
 			if (probe) {
 				skip = cmdp_monitor_failure(probe, why);
 				spin_lock_irqsave(&m->lock, flags);
+				if (m->dirty.mode)
+					cmdp_dirty_invalidate_locked(m, h);
 				c->report.skipped[skip]++;
 				if (skip == CMDP_MON_SKIP_RESOURCE)
 					m->status.resource_failures++;
@@ -1679,6 +1920,10 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			goto next;
 resource:
 			spin_lock_irqsave(&m->lock, flags);
+			if (m->dirty.mode) {
+				m->dirty.resource_skips++;
+				m->dirty.unknown++;
+			}
 			c->report.skipped[CMDP_MON_SKIP_RESOURCE]++;
 			m->status.resource_failures++;
 			spin_unlock_irqrestore(&m->lock, flags);
@@ -1699,8 +1944,11 @@ next:
 	c->report.end_ns = ktime_get_ns();
 	c->report.complete = !ret && addr >= TASK_SIZE_MAX;
 	c->report.error = ret;
-	if (c->report.complete)
+	if (c->report.complete) {
 		m->status.passes_completed++;
+		if (m->dirty.mode)
+			m->dirty.passes_completed++;
+	}
 	m->status.last_pass = c->report;
 	m->progress.scan_phase = CMDP_MON_SCAN_IDLE;
 	m->progress.phase_since_ns = ktime_get_ns();
@@ -1918,6 +2166,9 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 	struct cmdp_monitor_page page;
 	struct cmdp_monitor_cohort cohort;
 	struct cmdp_monitor_progress progress;
+	struct cmdp_monitor_dirty_config dirty_config;
+	struct cmdp_monitor_dirty_status dirty_status;
+	struct cmdp_monitor_dirty_page dirty_page;
 	struct cmdp_history *h;
 	struct cmdp_cohort *c;
 	unsigned long flags;
@@ -1944,6 +2195,80 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 		ret = cmdp_monitor_attach_target(m, &a);
+		break;
+	case CMDP_MON_DIRTY_CONFIG:
+		if (copy_from_user(&dirty_config, up, sizeof(dirty_config))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (dirty_config.size != sizeof(dirty_config) ||
+		    dirty_config.version != CMDP_MONITOR_VERSION ||
+		    dirty_config.mode > CMDP_MON_DIRTY_QUALIFY ||
+		    (dirty_config.quiet_ms && dirty_config.quiet_ms < 10) ||
+		    dirty_config.quiet_ms > 3600000 ||
+		    dirty_config.reserved[0] || dirty_config.reserved[1] ||
+		    (dirty_config.mode && (m->status.flags & CMDP_MONITOR_F_SCAN_ONLY))) {
+			ret = -EINVAL;
+			break;
+		}
+		if (!m->session || m->status.state != CMDP_MON_ATTACHED ||
+		    m->scanning || m->status.passes_started) {
+			ret = -EBUSY;
+			break;
+		}
+		m->dirty.mode = dirty_config.mode;
+		m->dirty.quiet_ms = dirty_config.quiet_ms ?: 10000;
+		break;
+	case CMDP_MON_DIRTY_STATUS:
+		if (copy_from_user(&dirty_status, up, sizeof(dirty_status))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (dirty_status.size != sizeof(dirty_status) ||
+		    dirty_status.version != CMDP_MONITOR_VERSION) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		dirty_status = m->dirty;
+		dirty_status.size = sizeof(dirty_status);
+		dirty_status.version = CMDP_MONITOR_VERSION;
+		dirty_status.now_ns = ktime_get_ns();
+		dirty_status.metadata_bytes = m->status.history_entries * sizeof(*h);
+		/* STOP invalidates the session observation contract immediately,
+		 * without a potentially unbounded walk of never-ARMED histories.
+		 */
+		if (m->status.state >= CMDP_MON_STOPPING)
+			dirty_status.valid_observations = 0;
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (copy_to_user(up, &dirty_status, sizeof(dirty_status)))
+			ret = -EFAULT;
+		break;
+	case CMDP_MON_DIRTY_PAGE:
+		if (copy_from_user(&dirty_page, up, sizeof(dirty_page))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (dirty_page.size != sizeof(dirty_page) ||
+		    dirty_page.version != CMDP_MONITOR_VERSION ||
+		    cmdp_validate_addr(dirty_page.addr)) {
+			ret = -EINVAL;
+			break;
+		}
+		h = xa_load(&m->history, dirty_page.addr >> PAGE_SHIFT);
+		if (!h) {
+			ret = -ENOENT;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		dirty_page = h->dirty;
+		dirty_page.size = sizeof(dirty_page);
+		dirty_page.version = CMDP_MONITOR_VERSION;
+		if (m->status.state >= CMDP_MON_STOPPING)
+			dirty_page.valid = 0;
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (copy_to_user(up, &dirty_page, sizeof(dirty_page)))
+			ret = -EFAULT;
 		break;
 	case CMDP_MON_START:
 	case CMDP_MON_SCAN_ONCE:

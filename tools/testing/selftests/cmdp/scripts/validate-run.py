@@ -87,6 +87,51 @@ def validate(path, minimum=1, compute_seconds=0):
             errors.append(f'Cohort {ident} clock order invalid')
     if final and sum(c['first_arms'] + c['rearms'] for c in final_cohorts.values()) != final.get('first_arms', 0) + final.get('rearms', 0):
         errors.append('Retained cohorts do not account for all session generations')
+    dirty_records = sorted((x for x in records if x.get('event') == 'dirty_status'),
+                           key=lambda x: x.get('now_ns', 0))
+    dirty_final = dirty_records[-1] if dirty_records else {}
+    dirty_mode = dirty_final.get('mode', 0)
+    dirty_cumulative = ('passes_started', 'passes_completed', 'samples', 'dirty', 'clean',
+                        'primed', 'unknown', 'qualified', 'late_dirty', 'resets', 'flushes',
+                        'reset_ns', 'flush_ns', 'sample_ns', 'invalidations', 'wp_resets',
+                        'resource_skips', 'metadata_bytes')
+    previous_dirty = None
+    for record in dirty_records:
+        if record.get('mode') not in (0, 1, 2):
+            errors.append('Unknown dirty sampling mode')
+        if record.get('mode') != dirty_mode:
+            errors.append('Dirty policy changed during a reported session')
+        if record.get('samples', 0) != record.get('dirty', 0) + record.get('clean', 0):
+            errors.append('Dirty samples do not equal dirty plus clean observations')
+        if not (record.get('primed', 0) <= record.get('resets', 0) <= record.get('samples', 0)):
+            errors.append('Dirty prime/reset/sample counts are inconsistent')
+        if record.get('resets', 0) != record.get('flushes', 0):
+            errors.append('A completed dirty reset lacks its synchronous flush')
+        if record.get('passes_completed', 0) > record.get('passes_started', 0):
+            errors.append('Dirty completed passes exceed issued passes')
+        if record.get('reset_ns', 0) + record.get('flush_ns', 0) > record.get('sample_ns', 0):
+            errors.append('Dirty sub-operation times exceed total sampling time')
+        if dirty_mode and record.get('quiet_ms', 0) < 10:
+            errors.append('Invalid reported quiet threshold')
+        if previous_dirty:
+            for key in dirty_cumulative:
+                if record.get(key, 0) < previous_dirty.get(key, 0):
+                    errors.append(f'Dirty cumulative {key} decreased')
+        previous_dirty = record
+    if dirty_mode:
+        if not dirty_final.get('samples'):
+            errors.append('Dirty policy performed no valid samples')
+        if final and dirty_final.get('valid_observations'):
+            errors.append('Stopped dirty session still reports valid observations')
+        if dirty_mode == 1 and final and (final.get('first_arms', 0) + final.get('rearms', 0)
+                                         or final.get('terminals', {}).get('write', 0)):
+            errors.append('Sampling-only policy unexpectedly armed or write-revoked pages')
+        if dirty_mode == 2 and final:
+            admissions = final.get('first_arms', 0) + final.get('rearms', 0)
+            if not admissions:
+                errors.append('Qualification run admitted no pages; admission test is vacuous')
+            if admissions > dirty_final.get('qualified', 0):
+                errors.append('Admissions exceed qualified observation epochs')
     log = (path / 'target.log').read_text(errors='replace') if (path / 'target.log').exists() else ''
     trials = [float(x) for x in re.findall(r'Trial Time:\s*([0-9.eE+-]+)', log)]
     if compute_seconds and sum(trials) < compute_seconds:
@@ -99,6 +144,7 @@ def validate(path, minimum=1, compute_seconds=0):
         'final_state_known': len(finals) == 1, 'last_observed': observed,
         'observation_end': observations[-1] if observations else {},
         'progress': progress[-1] if progress else {},
+        'dirty': dirty_final,
         'stop_request': stop_requests[-1] if stop_requests else {},
         'stop_return': stop_returns[-1] if stop_returns else {},
         'trial_count': len(trials), 'total_trial_seconds': sum(trials), 'final': final,
