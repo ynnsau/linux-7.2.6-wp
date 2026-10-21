@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -63,6 +64,7 @@ static const char *reason(unsigned int n)
 }
 static void pass_json(const char *event, const struct cmdp_monitor_pass *p)
 {
+	flockfile(stdout);
 	printf("{\"event\":\"%s\",\"observed_ns\":%" PRIu64 ",\"pass_id\":%llu,\"start_ns\":%llu,\"end_ns\":%llu,"
 	       "\"cursor\":%llu,\"writable_pages\":%llu,\"examined_pages\":%llu,"
 	       "\"resident_pages\":%llu,\"resident_pages_scope\":\"inspected_supported_vmas\",\"eligible_pages\":%llu,\"first_arms\":%llu,"
@@ -75,12 +77,14 @@ static void pass_json(const char *event, const struct cmdp_monitor_pass *p)
 	for (unsigned int i = 0; i < CMDP_MON_NR_SKIPS; i++)
 		printf("%s\"%s\":%llu", i ? "," : "", skips[i], p->skipped[i]);
 	puts("}}");
+	funlockfile(stdout);
 }
 static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 {
 	INIT_REQ(*s);
 	if (ioctl(fd, CMDP_MON_STATUS, s))
 		return -1;
+	flockfile(stdout);
 	printf("{\"event\":\"%s\",\"session_id\":%llu,\"target_pid\":%u,"
 	       "\"state\":%u,\"stop_reason\":\"%s\",\"now_ns\":%llu,"
 	       "\"attach_ns\":%llu,\"period_ms\":%u,\"flags\":%u,"
@@ -98,6 +102,39 @@ static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 	for (unsigned int i = 0; i < CMDP_MON_NR_REASONS; i++)
 		printf("%s\"%s\":%llu", i ? "," : "", reason(i), s->terminals[i]);
 	puts("}}");
+	funlockfile(stdout);
+	return 0;
+}
+
+static const char *scan_phase(unsigned int n)
+{
+	static const char *const names[] = { "idle", "prepare", "wait_mmap", "scanning" };
+	return n < sizeof(names) / sizeof(names[0]) ? names[n] : "unknown";
+}
+
+/* Additive ioctl: old kernels can still be observed without progress fields. */
+static int progress_read(int fd)
+{
+	struct cmdp_monitor_progress p;
+	INIT_REQ(p);
+	if (ioctl(fd, CMDP_MON_PROGRESS, &p)) {
+		if (errno == ENOTTY)
+			return 0;
+		return -1;
+	}
+	printf("{\"event\":\"progress\",\"now_ns\":%llu,\"scan_phase\":\"%s\","
+	       "\"phase_since_ns\":%llu,\"scan_lock_wait_ns\":%llu,\"scan_lock_wait_total_ns\":%llu,"
+	       "\"scan_lock_retries\":%llu,\"range_calls\":%llu,\"range_inflight\":%llu,"
+	       "\"range_ns\":%llu,\"range_max_ns\":%llu,\"lookup_calls\":%llu,"
+	       "\"lookup_nodes\":%llu,\"lookup_max_nodes\":%llu,\"index_lock_max_ns\":%llu,"
+	       "\"stop_request_ns\":%llu,\"stop_request_active\":%llu,\"stop_drain_ns\":%llu,"
+	       "\"stop_complete_ns\":%llu,\"write_calls\":%llu,\"write_ns\":%llu,\"write_max_ns\":%llu}\n",
+	       p.now_ns, scan_phase(p.scan_phase), p.phase_since_ns,
+	       p.scan_lock_wait_ns, p.scan_lock_wait_total_ns, p.scan_lock_retries,
+	       p.range_calls, p.range_inflight, p.range_ns, p.range_max_ns,
+	       p.lookup_calls, p.lookup_nodes, p.lookup_max_nodes, p.index_lock_max_ns,
+	       p.stop_request_ns, p.stop_request_active, p.stop_drain_ns, p.stop_complete_ns,
+	       p.write_calls, p.write_ns, p.write_max_ns);
 	return 0;
 }
 static void cohorts(int fd, uint64_t from, uint64_t to, const char *event)
@@ -111,6 +148,44 @@ static void cohorts(int fd, uint64_t from, uint64_t to, const char *event)
 		else
 			printf("{\"event\":\"cohort_missing\",\"pass_id\":%" PRIu64 ",\"errno\":%d}\n", id, errno);
 	}
+}
+
+struct stop_reporter {
+	int fd, wake[2], poll_ms, failed;
+	uint64_t seen;
+};
+
+/* The main thread owns STOP. Keep the session fd open until this joins. */
+static void *report_while_stopping(void *arg)
+{
+	struct stop_reporter *r = arg;
+	struct pollfd wake = { .fd = r->wake[0], .events = POLLIN };
+	for (;;) {
+		struct cmdp_monitor_status s;
+		if (status_read(r->fd, &s, "stopping_status")) {
+			perror("status during stop");
+			r->failed = 1;
+			break;
+		}
+		if (progress_read(r->fd)) {
+			perror("progress during stop");
+			r->failed = 1;
+		}
+		if (s.passes_completed > r->seen) {
+			cohorts(r->fd, r->seen + 1, s.passes_completed, "sweep");
+			r->seen = s.passes_completed;
+		}
+		cohorts(r->fd, 1, s.passes_started, "cohort_snapshot");
+		int n = poll(&wake, 1, r->poll_ms);
+		if (n > 0)
+			break;
+		if (n < 0 && errno != EINTR) {
+			perror("reporter poll");
+			r->failed = 1;
+			break;
+		}
+	}
+	return NULL;
 }
 static pid_t launch(char **argv)
 {
@@ -228,6 +303,7 @@ int main(int argc, char **argv)
 	result = 0;
 	for (;;) {
 		if (status_read(fd, &s, "status")) { perror("status"); result = 1; break; }
+		if (progress_read(fd)) { perror("progress"); result = 1; break; }
 		if (s.passes_completed > seen) {
 			cohorts(fd, seen + 1, s.passes_completed, "sweep");
 			seen = s.passes_completed;
@@ -243,7 +319,46 @@ int main(int argc, char **argv)
 	}
 out:
 	if (attached) {
-		if (ioctl(fd, CMDP_MON_STOP)) { perror("stop monitor"); result = 1; }
+		struct stop_reporter reporter = { .fd = fd, .poll_ms = poll_ms, .seen = seen };
+		pthread_t reporter_thread;
+		bool reporting = false;
+		/* This is the observation boundary, before any STOP cleanup. */
+		if (status_read(fd, &s, "observation_end")) {
+			perror("observation end status"); result = 1;
+		} else {
+			cohorts(fd, 1, s.passes_started, "cohort_observation_end");
+		}
+		if (progress_read(fd)) { perror("progress"); result = 1; }
+		if (pipe2(reporter.wake, O_CLOEXEC)) {
+			perror("reporter pipe"); result = 1;
+		} else {
+			int err = pthread_create(&reporter_thread, NULL, report_while_stopping, &reporter);
+			if (err) {
+				fprintf(stderr, "start stop reporter: %s\n", strerror(err));
+				close(reporter.wake[0]); close(reporter.wake[1]);
+				result = 1;
+			} else {
+				reporting = true;
+			}
+		}
+		uint64_t stop_start = now_ns();
+		printf("{\"event\":\"stop_request\",\"now_ns\":%" PRIu64 "}\n", stop_start);
+		int stop_rc = ioctl(fd, CMDP_MON_STOP);
+		int stop_errno = stop_rc ? errno : 0;
+		uint64_t stop_end = now_ns();
+		printf("{\"event\":\"stop_return\",\"now_ns\":%" PRIu64 ",\"elapsed_ns\":%" PRIu64 ",\"errno\":%d}\n",
+		       stop_end, stop_end - stop_start, stop_errno);
+		if (stop_rc) {
+			fprintf(stderr, "stop monitor: %s\n", strerror(stop_errno)); result = 1;
+		}
+		if (reporting) {
+			/* Closing the writer wakes poll with HUP, including after signals. */
+			close(reporter.wake[1]);
+			pthread_join(reporter_thread, NULL);
+			close(reporter.wake[0]);
+			if (reporter.failed) result = 1;
+		}
+		if (progress_read(fd)) { perror("final progress"); result = 1; }
 		if (status_read(fd, &s, "final")) { perror("final status"); result = 1; }
 		else {
 			cohorts(fd, 1, s.passes_started, "cohort_final");

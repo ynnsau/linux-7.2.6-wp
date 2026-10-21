@@ -101,6 +101,36 @@ struct cmdp_monitor_cohort {
 	struct cmdp_monitor_pass pass;
 };
 
+enum cmdp_monitor_scan_phase {
+	CMDP_MON_SCAN_IDLE, CMDP_MON_SCAN_PREPARE,
+	CMDP_MON_SCAN_WAIT_MMAP, CMDP_MON_SCAN_SCANNING,
+};
+
+/* Additive diagnostic ABI: existing status/pass layouts stay unchanged.
+ * Times are monotonic nanoseconds. range_* covers invalidation/modify
+ * callbacks (including history updates), not only application write faults.
+ * lookup_nodes counts address-tree comparisons, including unsuccessful finds.
+ * index_lock_max_ns measures hold time, excluding acquisition contention.
+ * write_* covers cmdp_prepare_write(), including waiters, not the whole
+ * architecture fault handler. scan_lock_wait_ns is the current wait only;
+ * total includes completed waits, including cancelled acquisition attempts.
+ */
+struct cmdp_monitor_progress {
+	__u32 size, version, scan_phase, reserved;
+	__u64 now_ns, phase_since_ns;
+	__u64 scan_lock_wait_ns, scan_lock_wait_total_ns, scan_lock_retries;
+	__u64 range_calls, range_inflight, range_ns, range_max_ns;
+	__u64 lookup_calls, lookup_nodes, lookup_max_nodes, index_lock_max_ns;
+	__u64 stop_request_ns, stop_request_active, stop_drain_ns, stop_complete_ns;
+	__u64 write_calls, write_ns, write_max_ns;
+	__u64 test_mmap_readers; /* Always zero without CONFIG_CMDP_TEST. */
+};
+
+/* Available only with CONFIG_CMDP_TEST; bounded deterministic contention. */
+struct cmdp_monitor_test_hold {
+	__u32 size, version, milliseconds, reserved;
+};
+
 #define CMDP_MON_ATTACH _IOW(CMDP_IOC_MAGIC, 16, struct cmdp_monitor_attach)
 #define CMDP_MON_START _IO(CMDP_IOC_MAGIC, 17)
 #define CMDP_MON_SCAN_ONCE _IO(CMDP_IOC_MAGIC, 18)
@@ -108,5 +138,7 @@ struct cmdp_monitor_cohort {
 #define CMDP_MON_STOP _IO(CMDP_IOC_MAGIC, 20)
 #define CMDP_MON_PAGE _IOWR(CMDP_IOC_MAGIC, 21, struct cmdp_monitor_page)
 #define CMDP_MON_COHORT _IOWR(CMDP_IOC_MAGIC, 22, struct cmdp_monitor_cohort)
+#define CMDP_MON_PROGRESS _IOWR(CMDP_IOC_MAGIC, 23, struct cmdp_monitor_progress)
+#define CMDP_MON_TEST_HOLD_MMAP _IOW(CMDP_IOC_MAGIC, 24, struct cmdp_monitor_test_hold)
 
 #endif /* _UAPI_LINUX_CMDP_H */

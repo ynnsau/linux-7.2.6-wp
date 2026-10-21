@@ -20,6 +20,7 @@
 #include <linux/module.h>
 #include <linux/pagemap.h>
 #include <linux/refcount.h>
+#include <linux/rbtree.h>
 #include <linux/rmap.h>
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
@@ -64,6 +65,8 @@ struct cmdp_history;
 struct cmdp_cohort;
 struct cmdp_alias {
 	unsigned long addr;
+	struct rb_node node;
+	struct cmdp_entry *entry;
 	/* Only dereferenced while arming under mmap write lock. */
 	struct vm_area_struct *vma;
 };
@@ -88,7 +91,7 @@ struct cmdp_entry {
 	int hw_result;
 	bool isolated;
 	bool registered;
-	struct list_head link;
+	bool indexed;
 	unsigned int nr_aliases;
 	unsigned int protected;
 	struct cmdp_alias aliases[CMDP_MAX_ALIASES];
@@ -101,8 +104,15 @@ struct cmdp_session {
 	refcount_t refs;
 	atomic_t open_files;
 	struct mutex commands;
-	/* The registry lock also protects this list, closing and cmdp_owner. */
-	struct list_head entries;
+	/* Registry -> address_lock is the only nested lock order. Range lookup
+	 * never takes the global PFN registry lock or walks unrelated entries.
+	 * Every alias stays indexed until the extra page ownership is gone.
+	 */
+	spinlock_t address_lock;
+	struct rb_root addresses;
+	u64 lookup_calls, lookup_nodes, lookup_max_nodes, index_lock_max_ns;
+	u64 write_calls, write_ns, write_max_ns;
+	/* The registry lock protects closing and cmdp_owner. */
 	bool closing;
 	bool notifier_registered;
 #ifdef CONFIG_CMDP_TEST
@@ -134,6 +144,7 @@ struct cmdp_monitor {
 	struct xarray history;
 	struct xarray cohorts;
 	struct cmdp_monitor_status status;
+	struct cmdp_monitor_progress progress;
 	struct cmdp_cohort *current_cohort;
 	u64 next_lifetime;
 	u64 account_ns;
@@ -164,7 +175,7 @@ static void cmdp_session_put(struct cmdp_session *s)
 void cmdp_put(struct cmdp_entry *e)
 {
 	if (refcount_dec_and_test(&e->refs)) {
-		WARN_ON_ONCE(e->registered || e->page || e->isolated);
+		WARN_ON_ONCE(e->registered || e->indexed || e->page || e->isolated);
 		atomic64_dec(&cmdp_stats[ENTRIES]);
 		cmdp_session_put(e->session);
 		kfree(e);
@@ -196,8 +207,12 @@ bool cmdp_mm_active(struct mm_struct *mm)
 
 	mmap_assert_write_locked(mm);
 	xa_lock_irqsave(&cmdp_entries, flags);
-	active = cmdp_owner && cmdp_owner->mm == mm &&
-		 !list_empty(&cmdp_owner->entries);
+	active = false;
+	if (cmdp_owner && cmdp_owner->mm == mm) {
+		spin_lock(&cmdp_owner->address_lock);
+		active = !RB_EMPTY_ROOT(&cmdp_owner->addresses);
+		spin_unlock(&cmdp_owner->address_lock);
+	}
 	xa_unlock_irqrestore(&cmdp_entries, flags);
 	return active;
 }
@@ -266,11 +281,55 @@ static int cmdp_hw_revoke(struct cmdp_entry *e)
 	return cmdp_hw_request(e, CMDP_REVOKE);
 }
 
+/* Caller holds address_lock. No allocation or sleeping in this index. */
+static int cmdp_index_insert(struct cmdp_entry *e)
+{
+	struct rb_root *root = &e->session->addresses;
+	unsigned int i;
+
+	for (i = 0; i < e->nr_aliases; i++) {
+		struct cmdp_alias *alias = &e->aliases[i];
+		struct rb_node **link = &root->rb_node, *parent = NULL;
+
+		while (*link) {
+			struct cmdp_alias *other = rb_entry(*link, struct cmdp_alias, node);
+
+			parent = *link;
+			if (alias->addr < other->addr)
+				link = &(*link)->rb_left;
+			else if (alias->addr > other->addr)
+				link = &(*link)->rb_right;
+			else
+				goto collision;
+		}
+		alias->entry = e;
+		rb_link_node(&alias->node, parent, link);
+		rb_insert_color(&alias->node, root);
+	}
+	e->indexed = true;
+	return 0;
+collision:
+	while (i)
+		rb_erase(&e->aliases[--i].node, root);
+	return -EEXIST;
+}
+
+static void cmdp_index_remove(struct cmdp_entry *e)
+{
+	unsigned int i;
+
+	for (i = 0; i < e->nr_aliases; i++)
+		rb_erase(&e->aliases[i].node, &e->session->addresses);
+	e->indexed = false;
+}
+
 /* Exactly one teardown owner; no MM locks are acquired here. */
 static void cmdp_finish(struct cmdp_entry *e, const char *reason)
 {
 	struct page *page = e->page;
+	struct cmdp_session *s = e->session;
 	unsigned long flags;
+	u64 start;
 	int old;
 
 	xa_lock_irqsave(&cmdp_entries, flags);
@@ -299,13 +358,15 @@ static void cmdp_finish(struct cmdp_entry *e, const char *reason)
 	e->page = NULL;
 	put_page(page);
 	/* Shutdown must still find this entry until page ownership is gone. */
-	xa_lock_irqsave(&cmdp_entries, flags);
-	list_del_init(&e->link);
-	xa_unlock_irqrestore(&cmdp_entries, flags);
+	spin_lock_irqsave(&s->address_lock, flags);
+	start = ktime_get_ns();
+	cmdp_index_remove(e);
+	s->index_lock_max_ns = max(s->index_lock_max_ns, ktime_get_ns() - start);
+	spin_unlock_irqrestore(&s->address_lock, flags);
 	/* Waiters must not refault until the extra page ownership is gone. */
 	complete_all(&e->terminal);
 	cmdp_put(e); /* registry */
-	cmdp_put(e); /* session association list */
+	cmdp_put(e); /* session address index */
 }
 
 static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
@@ -346,40 +407,96 @@ static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
 
 int cmdp_prepare_write(struct cmdp_entry *e)
 {
+	struct cmdp_session *s = e->session;
+	unsigned long flags;
+	u64 start = ktime_get_ns(), elapsed;
+	int ret;
+
 	/* ARMING owns mmap write and every alias's VMA write exclusion. */
 	if (WARN_ON_ONCE(atomic_read(&e->state) == CMDP_ARMING))
 		return -EBUSY;
-	return cmdp_revoke(e, "write");
-}
-
-static bool cmdp_overlaps(struct cmdp_entry *e, unsigned long start,
-			  unsigned long end)
-{
-	unsigned int i;
-
-	for (i = 0; i < e->nr_aliases; i++)
-		if (e->aliases[i].addr < end &&
-		    e->aliases[i].addr + PAGE_SIZE > start)
-			return true;
-	return false;
+	ret = cmdp_revoke(e, "write");
+	elapsed = ktime_get_ns() - start;
+	/* The caller's entry reference pins s even if STOP has freed m after
+	 * terminal completion. Keep these post-completion counters in s.
+	 */
+	spin_lock_irqsave(&s->address_lock, flags);
+	s->write_calls++;
+	s->write_ns += elapsed;
+	s->write_max_ns = max(s->write_max_ns, elapsed);
+	spin_unlock_irqrestore(&s->address_lock, flags);
+	return ret;
 }
 
 static struct cmdp_entry *cmdp_find_range(struct cmdp_session *s,
 		unsigned long start, unsigned long end)
 {
-	struct cmdp_entry *e, *found = NULL;
+	struct cmdp_entry *found = NULL;
+	struct rb_node *node;
+	struct cmdp_alias *candidate = NULL;
 	unsigned long flags;
+	u64 begin, nodes = 0;
 
-	xa_lock_irqsave(&cmdp_entries, flags);
-	list_for_each_entry(e, &s->entries, link) {
-		if (cmdp_overlaps(e, start, end)) {
-			refcount_inc(&e->refs);
-			found = e;
-			break;
+	if (start >= end)
+		return NULL;
+	/* All aliases are page aligned. Lower-bound lookup includes a page
+	 * partially overlapping an unaligned start, without addr+PAGE overflow.
+	 */
+	start &= PAGE_MASK;
+	spin_lock_irqsave(&s->address_lock, flags);
+	begin = ktime_get_ns();
+	node = s->addresses.rb_node;
+	while (node) {
+		struct cmdp_alias *alias = rb_entry(node, struct cmdp_alias, node);
+
+		nodes++;
+		if (alias->addr >= start) {
+			candidate = alias;
+			node = node->rb_left;
+		} else {
+			node = node->rb_right;
 		}
 	}
-	xa_unlock_irqrestore(&cmdp_entries, flags);
+	if (candidate && candidate->addr < end) {
+		found = candidate->entry;
+		refcount_inc(&found->refs);
+	}
+	s->lookup_calls++;
+	s->lookup_nodes += nodes;
+	s->lookup_max_nodes = max(s->lookup_max_nodes, nodes);
+	s->index_lock_max_ns = max(s->index_lock_max_ns, ktime_get_ns() - begin);
+	spin_unlock_irqrestore(&s->address_lock, flags);
 	return found;
+}
+
+static u64 cmdp_range_begin(struct cmdp_session *s)
+{
+	struct cmdp_monitor *m = s->monitor;
+	unsigned long flags;
+	u64 now = ktime_get_ns();
+
+	if (m) {
+		spin_lock_irqsave(&m->lock, flags);
+		m->progress.range_calls++;
+		m->progress.range_inflight++;
+		spin_unlock_irqrestore(&m->lock, flags);
+	}
+	return now;
+}
+
+static void cmdp_range_end(struct cmdp_session *s, u64 start)
+{
+	struct cmdp_monitor *m = s->monitor;
+	unsigned long flags;
+	u64 elapsed = ktime_get_ns() - start;
+
+	if (m) {
+		spin_lock_irqsave(&m->lock, flags);
+		m->progress.range_inflight--;
+		m->progress.range_ns += elapsed;
+		m->progress.range_max_ns = max(m->progress.range_max_ns, elapsed);
+		spin_unlock_irqrestore(&m->lock, flags);
+	}
 }
 
 static int cmdp_invalidate(struct mmu_notifier *mn,
@@ -387,17 +504,20 @@ static int cmdp_invalidate(struct mmu_notifier *mn,
 {
 	struct cmdp_session *s = container_of(mn, struct cmdp_session, notifier);
 	struct cmdp_entry *e;
-	int ret;
+	u64 start;
+	int ret = 0;
 
 	/* Our own alias protection notification, outside PTL/rmap locks. */
 	if (range->owner == s && range->event == MMU_NOTIFY_PROTECTION_PAGE)
 		return 0;
 
+	start = cmdp_range_begin(s);
 	cmdp_monitor_invalidate_history(s, range->start, range->end);
 	while ((e = cmdp_find_range(s, range->start, range->end))) {
 		if (!mmu_notifier_range_blockable(range)) {
 			cmdp_put(e);
-			return -EAGAIN;
+			ret = -EAGAIN;
+			break;
 		}
 		/*
 		 * Supported zap paths hold mmap/VMA exclusion, not rmap locks.
@@ -408,11 +528,13 @@ static int cmdp_invalidate(struct mmu_notifier *mn,
 		if (ret) {
 			/* Blockable invalidation cannot veto destruction. Fail closed. */
 			wait_for_completion(&e->terminal);
+			ret = 0;
 		}
 		cmdp_put(e);
 		cond_resched();
 	}
-	return 0;
+	cmdp_range_end(s, start);
+	return ret;
 }
 
 static void cmdp_release_mm(struct mmu_notifier *mn, struct mm_struct *mm)
@@ -437,6 +559,8 @@ static void cmdp_release_mm(struct mmu_notifier *mn, struct mm_struct *mm)
 	if (s->monitor) {
 		spin_lock_irqsave(&s->monitor->lock, flags);
 		s->monitor->status.state = CMDP_MON_STOPPED;
+		if (!s->monitor->progress.stop_complete_ns)
+			s->monitor->progress.stop_complete_ns = ktime_get_ns();
 		spin_unlock_irqrestore(&s->monitor->lock, flags);
 	}
 }
@@ -557,7 +681,6 @@ static int cmdp_arm_locked(struct cmdp_session *s, unsigned long addr,
 	init_completion(&e->terminal);
 	init_completion(&e->arm_done);
 	init_completion(&e->hw_completion);
-	INIT_LIST_HEAD(&e->link);
 	mmap_assert_write_locked(s->mm);
 	if (READ_ONCE(s->closing)) {
 		ret = -ESHUTDOWN;
@@ -636,14 +759,25 @@ static int cmdp_arm_locked(struct cmdp_session *s, unsigned long addr,
 	if (s->closing || xa_load(&cmdp_entries, e->pfn)) {
 		ret = -EBUSY;
 	} else {
-		ret = xa_err(__xa_store(&cmdp_entries, e->pfn, e, GFP_NOWAIT));
+		u64 index_start;
+
+		spin_lock(&s->address_lock);
+		index_start = ktime_get_ns();
+		ret = cmdp_index_insert(e);
 		if (!ret) {
-			refcount_add(2, &e->refs); /* table + session list */
-			list_add_tail(&e->link, &s->entries);
+			ret = xa_err(__xa_store(&cmdp_entries, e->pfn, e, GFP_NOWAIT));
+			if (ret)
+				cmdp_index_remove(e);
+		}
+		if (!ret) {
+			refcount_add(2, &e->refs); /* PFN registry + address index */
 			e->registered = true;
 			SetPageCmdp(e->page);
 			atomic64_inc(&cmdp_stats[MANAGED]);
 		}
+		s->index_lock_max_ns = max(s->index_lock_max_ns,
+					  ktime_get_ns() - index_start);
+		spin_unlock(&s->address_lock);
 	}
 	xa_unlock_irqrestore(&cmdp_entries, flags);
 	xa_release(&cmdp_entries, e->pfn);
@@ -803,7 +937,8 @@ static int cmdp_session_open(struct mm_struct *mm, struct cmdp_session **result,
 	refcount_set(&s->refs, 1); /* Owner reference. */
 	atomic_set(&s->open_files, 1);
 	mutex_init(&s->commands);
-	INIT_LIST_HEAD(&s->entries);
+	spin_lock_init(&s->address_lock);
+	s->addresses = RB_ROOT;
 	s->notifier.ops = &cmdp_notifier_ops;
 
 	xa_lock_irqsave(&cmdp_entries, flags);
@@ -1001,6 +1136,8 @@ static void cmdp_monitor_mark_stop(struct cmdp_monitor *m, unsigned int reason)
 	if (m->status.state < CMDP_MON_STOPPING) {
 		m->status.state = CMDP_MON_STOPPING;
 		m->status.stop_reason = reason;
+		m->progress.stop_request_ns = ktime_get_ns();
+		m->progress.stop_request_active = m->status.active;
 	}
 	spin_unlock_irqrestore(&m->lock, flags);
 }
@@ -1013,6 +1150,7 @@ static void cmdp_monitor_snapshot_stop(struct cmdp_monitor *m)
 	if (!m->stop_snapshot) {
 		m->status.pre_stop_active = m->status.active;
 		m->stop_snapshot = true;
+		m->progress.stop_drain_ns = ktime_get_ns();
 	}
 	spin_unlock_irqrestore(&m->lock, flags);
 }
@@ -1155,6 +1293,7 @@ int cmdp_mm_modify(struct mm_struct *mm, unsigned long start, unsigned long end)
 {
 	struct cmdp_session *s;
 	struct cmdp_entry *e;
+	u64 begin;
 	int ret = 0;
 
 	mmap_assert_write_locked(mm);
@@ -1165,6 +1304,7 @@ int cmdp_mm_modify(struct mm_struct *mm, unsigned long start, unsigned long end)
 		ret = cmdp_mm_active(mm) ? -EBUSY : 0;
 		goto out;
 	}
+	begin = cmdp_range_begin(s);
 	cmdp_monitor_invalidate_history(s, start, end);
 	while ((e = cmdp_find_range(s, start, end))) {
 		ret = cmdp_revoke(e, "invalidate");
@@ -1173,6 +1313,7 @@ int cmdp_mm_modify(struct mm_struct *mm, unsigned long start, unsigned long end)
 			break;
 		cond_resched();
 	}
+	cmdp_range_end(s, begin);
 out:
 	cmdp_session_put(s);
 	return ret;
@@ -1201,6 +1342,8 @@ void cmdp_mm_stop_locked(struct mm_struct *mm, unsigned int reason)
 		}
 		spin_lock_irqsave(&s->monitor->lock, flags);
 		s->monitor->status.state = CMDP_MON_STOPPED;
+		if (!s->monitor->progress.stop_complete_ns)
+			s->monitor->progress.stop_complete_ns = ktime_get_ns();
 		spin_unlock_irqrestore(&s->monitor->lock, flags);
 	}
 	cmdp_session_put(s);
@@ -1326,6 +1469,65 @@ static unsigned int cmdp_monitor_failure(int ret, const char *why)
 	return CMDP_MON_SKIP_OTHER;
 }
 
+static void cmdp_monitor_phase(struct cmdp_monitor *m, unsigned int phase)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->lock, flags);
+	m->progress.scan_phase = phase;
+	m->progress.phase_since_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&m->lock, flags);
+}
+
+/* This kernel has no mmap_write_trylock wrapper. Match mmap_write_lock's
+ * tracing and per-VMA sequence protocol; a bare down_write_trylock would
+ * not pair correctly with mmap_write_unlock's vma_end_write_all().
+ */
+static bool cmdp_mmap_write_trylock(struct mm_struct *mm)
+{
+	bool acquired;
+
+	__mmap_lock_trace_start_locking(mm, true);
+	acquired = down_write_trylock(&mm->mmap_lock) != 0;
+	if (acquired)
+		mm_lock_seqcount_begin(mm);
+	__mmap_lock_trace_acquire_returned(mm, true, acquired);
+	return acquired;
+}
+
+/* A worker cannot receive the controller's signal. Never sleep indefinitely
+ * in mmap_write_lock(): STOP must be able to join this scanner before it
+ * performs the separately reported, mandatory ownership drain.
+ */
+static bool cmdp_monitor_scan_lock(struct cmdp_monitor *m)
+{
+	struct cmdp_session *s = m->session;
+	unsigned long flags;
+	u64 start = ktime_get_ns();
+	bool acquired = false;
+
+	cmdp_monitor_phase(m, CMDP_MON_SCAN_WAIT_MMAP);
+	for (;;) {
+		if (READ_ONCE(s->closing) ||
+		    READ_ONCE(m->status.state) >= CMDP_MON_STOPPING)
+			break;
+		if (cmdp_mmap_write_trylock(s->mm)) {
+			acquired = true;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		m->progress.scan_lock_retries++;
+		spin_unlock_irqrestore(&m->lock, flags);
+		schedule_timeout_uninterruptible(1);
+	}
+	spin_lock_irqsave(&m->lock, flags);
+	m->progress.scan_lock_wait_total_ns += ktime_get_ns() - start;
+	m->progress.scan_phase = acquired ? CMDP_MON_SCAN_SCANNING : CMDP_MON_SCAN_IDLE;
+	m->progress.phase_since_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&m->lock, flags);
+	return acquired;
+}
+
 static int cmdp_monitor_scan(struct cmdp_monitor *m)
 {
 	struct cmdp_session *s = m->session;
@@ -1373,6 +1575,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 	/* Pending allocation/putback batches also own transient references.
 	 * Flush once per pass; unlike remote GUP, our lookup adds no new ones.
 	 */
+	cmdp_monitor_phase(m, CMDP_MON_SCAN_PREPARE);
 	lru_add_drain_all();
 	while (addr < TASK_SIZE_MAX) {
 		if (READ_ONCE(m->status.state) >= CMDP_MON_STOPPING) {
@@ -1384,7 +1587,11 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			ret = -ESRCH;
 			break;
 		}
-		mmap_write_lock(s->mm);
+		if (!cmdp_monitor_scan_lock(m)) {
+			mmput(s->mm);
+			ret = -ESHUTDOWN;
+			break;
+		}
 		for (batch = 0; batch < CMDP_MON_BATCH && addr < TASK_SIZE_MAX; batch++) {
 			if (READ_ONCE(s->closing) ||
 			    READ_ONCE(m->status.state) >= CMDP_MON_STOPPING) {
@@ -1495,6 +1702,8 @@ next:
 	if (c->report.complete)
 		m->status.passes_completed++;
 	m->status.last_pass = c->report;
+	m->progress.scan_phase = CMDP_MON_SCAN_IDLE;
+	m->progress.phase_since_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
 }
@@ -1543,7 +1752,10 @@ static void cmdp_monitor_work(struct work_struct *work)
 			schedule_delayed_work(&m->work, nsecs_to_jiffies(delay));
 		mutex_unlock(&m->ctl);
 	}
-	if (ret && m->session)
+	/* STOP owns cleanup after joining us. Re-entering mmap_write_lock here
+	 * on cancellation would recreate the uninterruptible join dependency.
+	 */
+	if (ret && ret != -ESHUTDOWN && ret != -ESRCH && m->session)
 		cmdp_mm_stop(m->session->mm, m->status.stop_reason ?: CMDP_MON_ERROR);
 }
 
@@ -1570,6 +1782,8 @@ static void cmdp_monitor_stop(struct cmdp_monitor *m, unsigned int reason)
 	}
 	spin_lock_irqsave(&m->lock, flags);
 	m->status.state = CMDP_MON_STOPPED;
+	if (!m->progress.stop_complete_ns)
+		m->progress.stop_complete_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&m->lock, flags);
 	mutex_unlock(&m->scan);
 }
@@ -1624,6 +1838,7 @@ static int cmdp_monitor_attach_target(struct cmdp_monitor *m,
 	if (ret) {
 		spin_lock_irqsave(&m->lock, flags);
 		memset(&m->status, 0, sizeof(m->status));
+		memset(&m->progress, 0, sizeof(m->progress));
 		m->account_ns = 0;
 		m->stop_snapshot = false;
 		spin_unlock_irqrestore(&m->lock, flags);
@@ -1656,6 +1871,43 @@ task_out:
 	return ret;
 }
 
+#ifdef CONFIG_CMDP_TEST
+static long cmdp_monitor_test_hold_mmap(struct cmdp_monitor *m, void __user *up)
+{
+	struct cmdp_monitor_test_hold hold;
+	struct mm_struct *mm = NULL;
+	unsigned long flags;
+	int ret;
+
+	if (copy_from_user(&hold, up, sizeof(hold)))
+		return -EFAULT;
+	if (hold.size != sizeof(hold) || hold.version != CMDP_MONITOR_VERSION ||
+	    hold.reserved || !hold.milliseconds || hold.milliseconds > 2000)
+		return -EINVAL;
+	mutex_lock(&m->ctl);
+	if (m->session && READ_ONCE(m->status.state) < CMDP_MON_STOPPING &&
+	    mmget_not_zero(m->session->mm))
+		mm = m->session->mm;
+	mutex_unlock(&m->ctl);
+	if (!mm)
+		return -ESRCH;
+	ret = mmap_read_lock_killable(mm);
+	if (ret)
+		goto put;
+	spin_lock_irqsave(&m->lock, flags);
+	m->progress.test_mmap_readers++;
+	spin_unlock_irqrestore(&m->lock, flags);
+	msleep(hold.milliseconds);
+	spin_lock_irqsave(&m->lock, flags);
+	m->progress.test_mmap_readers--;
+	spin_unlock_irqrestore(&m->lock, flags);
+	mmap_read_unlock(mm);
+put:
+	mmput(mm);
+	return ret;
+}
+#endif
+
 static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		unsigned long arg)
 {
@@ -1665,6 +1917,7 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 	struct cmdp_monitor_status status;
 	struct cmdp_monitor_page page;
 	struct cmdp_monitor_cohort cohort;
+	struct cmdp_monitor_progress progress;
 	struct cmdp_history *h;
 	struct cmdp_cohort *c;
 	unsigned long flags;
@@ -1672,6 +1925,10 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
+#ifdef CONFIG_CMDP_TEST
+	if (cmd == CMDP_MON_TEST_HOLD_MMAP)
+		return cmdp_monitor_test_hold_mmap(m, up);
+#endif
 	if (cmd == CMDP_MON_STOP) {
 		mutex_lock(&m->ctl);
 		cmdp_monitor_mark_stop(m, CMDP_MON_CONTROL_STOP);
@@ -1737,6 +1994,40 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			status.last_pass = m->current_cohort->report;
 		spin_unlock_irqrestore(&m->lock, flags);
 		if (copy_to_user(up, &status, sizeof(status)))
+			ret = -EFAULT;
+		break;
+	case CMDP_MON_PROGRESS:
+		if (copy_from_user(&progress, up, sizeof(progress))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (progress.size != sizeof(progress) ||
+		    progress.version != CMDP_MONITOR_VERSION || progress.reserved) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		progress = m->progress;
+		progress.size = sizeof(progress);
+		progress.version = CMDP_MONITOR_VERSION;
+		progress.now_ns = ktime_get_ns();
+		if (progress.scan_phase == CMDP_MON_SCAN_WAIT_MMAP)
+			progress.scan_lock_wait_ns = progress.now_ns - progress.phase_since_ns;
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (m->session) {
+			struct cmdp_session *s = m->session;
+
+			spin_lock_irqsave(&s->address_lock, flags);
+			progress.lookup_calls = s->lookup_calls;
+			progress.lookup_nodes = s->lookup_nodes;
+			progress.lookup_max_nodes = s->lookup_max_nodes;
+			progress.index_lock_max_ns = s->index_lock_max_ns;
+			progress.write_calls = s->write_calls;
+			progress.write_ns = s->write_ns;
+			progress.write_max_ns = s->write_max_ns;
+			spin_unlock_irqrestore(&s->address_lock, flags);
+		}
+		if (copy_to_user(up, &progress, sizeof(progress)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_PAGE:
