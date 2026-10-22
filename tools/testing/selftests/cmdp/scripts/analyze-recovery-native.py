@@ -170,13 +170,16 @@ def main():
     p.add_argument('base', type=Path)
     p.add_argument('--output', type=Path)
     p.add_argument('--matrix', choices=('bfs-pr', 'cc-bc'), default='bfs-pr')
+    p.add_argument('--cc4-base', type=Path, help='Explicit duration-refinement base for CC4; preserve the original base')
     a = p.parse_args(); out = a.output or a.base / 'recovery-analysis'
     out.mkdir(parents=True, exist_ok=False)
     results, plots = {}, {}
     for app in a.matrix.split('-'):
         for threads in (1, 4):
             key = '{}-{}'.format(app, threads)
-            results[key], plots[key] = analyze(a.base, app, threads)
+            selected_base = a.cc4_base if (a.cc4_base and app == 'cc' and threads == 4) else a.base
+            results[key], plots[key] = analyze(selected_base, app, threads)
+            results[key]['selected_run_base'] = str(selected_base)
     if len({r['kernel_commit'] for r in results.values()}) != 1:
         raise ValueError('Matrix used different kernel implementations')
     (out / 'analysis.json').write_text(json.dumps(results, indent=2) + '\n')
