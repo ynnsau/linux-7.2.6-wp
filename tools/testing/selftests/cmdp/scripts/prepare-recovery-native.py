@@ -19,6 +19,8 @@ import subprocess
 import tempfile
 
 RELEASE = '7.2.6-cmdp-rearm-production'
+# Original study graph checksum recorded in the 2026-10-20 Twitter setup.
+TWITTER_SHA256 = '4b7e5193a8e3384b8319359dc8c92534b8aee8e48d6c3bd0820451bb307d6eea'
 
 
 def sha(path):
@@ -93,6 +95,8 @@ def main():
     assert int.from_bytes(head[1:9], 'little') == 1468364884
     assert int.from_bytes(head[9:17], 'little') == 61578415
     assert a.graph.stat().st_size == 12732173745
+    graph_sha256 = sha(a.graph)
+    assert graph_sha256 == TWITTER_SHA256, 'Graph differs from the original study Twitter graph'
     assert not a.base.exists(), 'Use a fresh experiment base'
     script = a.source / 'tools/testing/selftests/cmdp/scripts/prepare-dirty-native.py'
     spec = importlib.util.spec_from_file_location('prepare_previous', str(script))
@@ -122,7 +126,7 @@ def main():
     audit.update({'recovery_ready': True, 'kernel_commit': a.kernel_commit,
                   'kernel_image_sha256': sha(image), 'kernel_build_id': running_build_id(),
                   'bfs_path': str(a.bfs), 'pr_path': str(a.pr),
-                  'pr_sha256': sha(a.pr), 'graph': str(a.graph), 'graph_sha256': sha(a.graph),
+                  'pr_sha256': sha(a.pr), 'graph': str(a.graph), 'graph_sha256': graph_sha256,
                   'graph_bytes': a.graph.stat().st_size,
                   'tools_build_sha256': sha(tools / 'tools-build.json'),
                   'installation_record_sha256': sha(a.installation_record),
