@@ -276,4 +276,19 @@ struct cmdp_monitor_test_pte {
 };
 #define CMDP_MON_TEST_PTE _IOWR(CMDP_IOC_MAGIC, 31, struct cmdp_monitor_test_pte)
 
+/* CONFIG_CMDP_TEST only, one-shot injection for the chunk covering addr.
+ * Configure while ATTACHED (no asynchronous worker). A bounded pause occurs
+ * after reset/protection but before the shared flush. abort_after additionally
+ * aborts an ARM batch after N PTEs were protected; all are flushed/cleaned up.
+ * The root-only debugfs test_batch_waiting gauge exposes the paused phase.
+ */
+#define CMDP_MON_TEST_BATCH_DIRTY 1
+#define CMDP_MON_TEST_BATCH_ARM 2
+struct cmdp_monitor_test_batch {
+	__u32 size, version, phase, delay_ms;
+	__u64 addr;
+	__u32 abort_after, reserved;
+};
+#define CMDP_MON_TEST_BATCH _IOW(CMDP_IOC_MAGIC, 32, struct cmdp_monitor_test_batch)
+
 #endif /* _UAPI_LINUX_CMDP_H */
