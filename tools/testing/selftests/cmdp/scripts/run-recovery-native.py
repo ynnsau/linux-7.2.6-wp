@@ -5,6 +5,8 @@ Use a fresh prepare-recovery-native.py audit. Sequence: small; verify BFS/PR at
 one/four threads; BFS sizing at both thread counts; then four observe cells.
 Every observation finishes whole trials. PR uses one/four trials for one/four
 threads; BFS freezes a pilot-based count targeting 240 seconds total elapsed.
+The cc-bc matrix uses stock CC and one-source BC trials, each sized by a separate
+pilot to --target-total-seconds (use 120 for the CC/BC protocol).
 """
 import argparse
 import importlib.util
@@ -65,7 +67,7 @@ class Recovery(previous.Harness):
             assert item['exit'] == 0 and sha(self.bindir / name) == item['binary_sha256']
             assert sha(a.source / 'tools/testing/selftests/cmdp' / (name + '.c')) == item['source_sha256']
         assert {'cmdp_test', 'cmdp_monitor_test', 'cmdp_dirty_test', 'cmdp_recovery_test', 'cmdp_monitor'} <= names
-        for application in ('bfs', 'pr'):
+        for application in a.applications:
             binary = getattr(a, application)
             assert sha(binary) == audit[application + '_sha256']
             assert output(['git', '-C', binary.parent, 'rev-parse', 'HEAD']) == audit['gapbs_commit']
@@ -90,14 +92,15 @@ class Recovery(previous.Harness):
              'kernel_image_sha256': a.kernel_sha256, 'running_build_id': a.kernel_build_id,
              'postboot_audit_sha256': sha(a.base / 'postboot-audit.json'),
              'graph_sha256': audit['graph_sha256'],
-             'bfs_path': str(a.bfs), 'pr_path': str(a.pr),
-             'bfs_sha256': audit['bfs_sha256'], 'pr_sha256': audit['pr_sha256']})
+             **{app + suffix: audit[app + suffix] for app in a.applications
+                for suffix in ('_path', '_sha256')}})
         save(self.out / 'phase-profile.json', {'phase': a.operation, 'application': a.application,
              'threads': a.threads, 'period_ms': 10000, 'quiet_ms': 10000, 'poll_ms': 1000,
-             'target_total_elapsed_seconds': 240, 'host_settings_changed': False,
+             'target_total_elapsed_seconds': a.target_total_seconds, 'matrix': a.matrix, 'host_settings_changed': False,
              'observation_scope': 'launch through exit and STOP, including graph load and initialization',
              'pr_max_iterations': 1000, 'pr_tolerance': 1e-4,
-             'generated_matrix': {'applications': ['bfs', 'pr'], 'threads': [1, 4],
+             'bc_sources_per_trial': 1,
+             'generated_matrix': {'applications': a.applications, 'threads': [1, 4],
                                   'quiet_ms': 10, 'period_ms': 100} if a.operation == 'small' else None})
 
     def receipt(self, phase, app=None, threads=None):
@@ -132,6 +135,7 @@ class Recovery(previous.Harness):
         argv += ['-g', '18'] if generated else ['-f', self.a.graph]
         argv += ['-n', str(trials)]
         if app == 'pr': argv += ['-i', '1000', '-t', '1e-4', '-l']
+        if app == 'bc': argv += ['-i', '1', '-l']
         if verify: argv += ['-v']
         env = {'OMP_NUM_THREADS': str(threads), 'OMP_DYNAMIC': 'FALSE',
                'OMP_PROC_BIND': 'close', 'OMP_PLACES': 'cores'}
@@ -191,20 +195,22 @@ class Recovery(previous.Harness):
             assert selection['application'] == a.application and selection['threads'] == a.threads
             assert type(selection['trials']) is int and selection['trials'] > 0
             assert selection['source_commit'] == a.expected_source_commit
+            assert selection['target_total_seconds'] == a.target_total_seconds
             return selection['trials']
         if a.application == 'pr':
             trials = 1 if a.threads == 1 else 4
             reason = {'selection': 'fixed complete converged trials from the agreed protocol'}
         else:
-            sizing, receipt = self.receipt('twitter-sizing', 'bfs', a.threads)
+            sizing, receipt = self.receipt('twitter-sizing', a.application, a.threads)
             pilot = sizing['runs']['run']
             mean = pilot['trial_seconds'] / pilot['trial_count']
             overhead = max(0, pilot['application_and_monitor_elapsed_seconds'] - pilot['trial_seconds'])
-            trials = max(1, int(math.floor((240 - overhead) / mean + .5)))
-            reason = {'selection': 'nearest whole trial count to 240 seconds total', 'mean_trial_seconds': mean,
+            trials = max(1, int(math.floor((a.target_total_seconds - overhead) / mean + .5)))
+            reason = {'selection': 'nearest whole trial count to requested total elapsed', 'mean_trial_seconds': mean,
                       'non_trial_seconds': overhead, 'pilot_sha256': sha(receipt)}
         selection = dict(reason, trials=trials, boot_id=self.before['boot_id'], kernel_commit=a.kernel_commit,
-                         application=a.application, threads=a.threads, source_commit=a.expected_source_commit)
+                         application=a.application, threads=a.threads, source_commit=a.expected_source_commit,
+                         target_total_seconds=a.target_total_seconds)
         # Never silently overwrite a chosen workload size.
         with path.open('x') as f: json.dump(selection, f, indent=2); f.write('\n')
         return trials
@@ -216,15 +222,15 @@ class Recovery(previous.Harness):
             for name, program in (('legacy', 'cmdp_test'), ('monitor', 'cmdp_monitor_test'), ('dirty', 'cmdp_dirty_test')):
                 self.tap(name, program)
             for threads in (1, 4): self.tap('recovery-t' + str(threads), 'cmdp_recovery_test', ('--threads', str(threads)))
-            for app in ('bfs', 'pr'):
+            for app in a.applications:
                 for threads in (1, 4): self.workload(app + str(threads), app, threads, 8, generated=True, verify=True)
         else:
             self.receipt('small')
             if a.operation != 'twitter-verify': self.receipt('twitter-verify', a.application, a.threads)
             if a.operation == 'twitter-verify': trials = 3 if a.application == 'bfs' else 1
             elif a.operation == 'twitter-sizing':
-                assert a.application == 'bfs', 'PR uses fixed converged trial counts, not another sizing run'
-                trials = 16 if a.threads == 1 else 36
+                assert a.application != 'pr', 'PR uses fixed converged trial counts'
+                trials = (16 if a.threads == 1 else 36) if a.application == 'bfs' else 2
             else: trials = self.frozen_trials()
             self.workload('run', a.application, a.threads, trials, verify=a.operation == 'twitter-verify')
         final = self.guard('final')
@@ -238,18 +244,25 @@ class Recovery(previous.Harness):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('phase', choices=('small', 'twitter-verify', 'twitter-sizing', 'twitter-observe'))
-    p.add_argument('--application', choices=('bfs', 'pr'), default='bfs')
+    p.add_argument('--application', choices=('bfs', 'pr', 'cc', 'bc'), default='bfs')
+    p.add_argument('--matrix', choices=('bfs-pr', 'cc-bc'), default='bfs-pr')
+    p.add_argument('--target-total-seconds', type=float, default=240)
     p.add_argument('--base', type=Path, required=True)
     p.add_argument('--source', type=Path, default=Path('/home/yans3/cmdp-v2/linux-rearm-recovery'))
     p.add_argument('--threads', type=int, choices=(1, 4), default=1)
     p.add_argument('--bfs', type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs/bfs'))
     p.add_argument('--pr', type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs/pr'))
+    for app in ('cc', 'bc'):
+        p.add_argument('--' + app, type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs') / app)
     p.add_argument('--graph', type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs/benchmark/graphs/twitter.sg'))
     p.add_argument('--kernel-commit', required=True)
     p.add_argument('--kernel-sha256', required=True)
     p.add_argument('--kernel-build-id', required=True)
     p.add_argument('--expected-source-commit', required=True)
     a = p.parse_args()
+    a.applications = a.matrix.split('-')
+    assert a.phase == 'small' or a.application in a.applications
+    assert math.isfinite(a.target_total_seconds) and a.target_total_seconds > 0
     a.tools_dir = a.base / 'tools'
     def interrupted(signum, frame):
         raise RuntimeError('Harness interrupted by signal ' + str(signum))

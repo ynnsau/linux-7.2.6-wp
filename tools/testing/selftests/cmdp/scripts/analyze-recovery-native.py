@@ -92,7 +92,7 @@ def analyze(base, app, threads):
     command = previous.read_json(run / 'command.json')
     expected_exe = command['argv'][command['argv'].index('--') + 1]
     if expected_exe != audit[app + '_path'] or source[app + '_sha256'] != audit[app + '_sha256']:
-        raise ValueError('Application executable is not bound to the audited BFS/PR binary')
+        raise ValueError('Application executable is not bound to the audited application binary')
     result['thread_activity'] = previous.analyze_threads(thread_rows, threads, origin, expected_exe)
     target_rows = [r for r in thread_rows if r.get('exe') == expected_exe and len(r.get('threads', [])) == threads]
     result['diagnostics'] = validation['diagnostics']
@@ -169,10 +169,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('base', type=Path)
     p.add_argument('--output', type=Path)
+    p.add_argument('--matrix', choices=('bfs-pr', 'cc-bc'), default='bfs-pr')
     a = p.parse_args(); out = a.output or a.base / 'recovery-analysis'
     out.mkdir(parents=True, exist_ok=False)
     results, plots = {}, {}
-    for app in ('bfs', 'pr'):
+    for app in a.matrix.split('-'):
         for threads in (1, 4):
             key = '{}-{}'.format(app, threads)
             results[key], plots[key] = analyze(a.base, app, threads)

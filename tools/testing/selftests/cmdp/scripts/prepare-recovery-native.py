@@ -58,6 +58,8 @@ def main():
     p.add_argument('--source', type=Path, default=Path('/home/yans3/cmdp-v2/linux-rearm-recovery'))
     p.add_argument('--bfs', type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs/bfs'))
     p.add_argument('--pr', type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs/pr'))
+    for app in ('cc', 'bc'):
+        p.add_argument('--' + app, type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs') / app)
     p.add_argument('--graph', type=Path, default=Path('/home/yans3/cmdp-v2/gapbs-study/gapbs/benchmark/graphs/twitter.sg'))
     p.add_argument('--installation-record', type=Path, required=True)
     p.add_argument('--build-record', type=Path, required=True)
@@ -132,6 +134,11 @@ def main():
                   'installation_record_sha256': sha(a.installation_record),
                   'build_record_sha256': sha(a.build_record),
                   'installation_host_after_sha256': sha(after_path)})
+    for app in ('cc', 'bc'):
+        binary = getattr(a, app)
+        assert binary.parent == a.bfs.parent
+        audit[app + '_path'] = str(binary)
+        audit[app + '_sha256'] = sha(binary)
     (a.base / 'postboot-audit.json').write_text(json.dumps(audit, indent=2) + '\n')
     print(json.dumps({'pass': True, 'kernel': RELEASE, 'boot_id': audit['boot_id'],
                       'kernel_build_id': audit['kernel_build_id'], 'tools': len(build['builds']),
