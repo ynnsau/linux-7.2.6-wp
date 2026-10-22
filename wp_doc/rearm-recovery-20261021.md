@@ -1,9 +1,12 @@
 # CMD-P ARM recovery: 2026-10-21 build and experiment handoff
 
-**Build status:** the diagnostic-only defect reproduction and all six suites
-on both debug and production images have passed. The full production build completed successfully with 5,072 modules.
-Installation verification and native recovery measurements
-remain **pending**. The production image is `7.2.6-cmdp-rearm-production`; it is not yet installed or booted. GRUB selection and reboot remain with the user.
+**Status:** the recovery implementation, diagnostics, regression tests and native
+measurement tools are committed and pushed. The baseline reproducer, all six
+debug suites and all six production suites passed. The full kernel and 5,072
+modules were built and installed as **`7.2.6-cmdp-rearm-production`**. Installation
+verification passed all 366 checks. GRUB is unchanged and no reboot was performed;
+BMP still runs `7.2.6-cmdp-dirty-production`. Native recovery measurements remain
+pending the user's GRUB selection and reboot.
 
 ## Problem and resulting behavior
 
@@ -177,11 +180,25 @@ Installation acceptance must establish unchanged GRUB contents/recorded metadata
 existing boot links/files, running kernel, boot ID and CMD-P counters; exact module
 paths/counts; signed sample module payloads matching stripped build modules; the
 signing certificate embedded in the installed image; and extracted NVMe initramfs
-module bytes matching the installed modules. The planned installation evidence
+module bytes matching the installed modules. The completed installation evidence
 root is `/home/yans3/cmdp-v2/periodic/native-install-rearm-recovery-20261021`.
 
-**At this draft checkpoint, no production installation success is claimed.**
-After installation is verified, the user chooses GRUB and reboots. Native tests
+Installation completed with exit zero and `installation-verification.json`
+reporting `pass: true` for all 366 checks. All 5,072 modules are installed; the
+NVMe initramfs contents and five storage/network module signatures and payloads
+were verified. GRUB, existing boot files/links, boot ID, running kernel and host
+CMD-P counters were unchanged, and there were no new kernel-log lines.
+
+The approved build report SHA-256 is
+`abb53032b7ce079629e0ae3b6f7abc8e98ac1acc76d204ab218727dd1a2cb5c9`;
+the installation report SHA-256 is
+`2d798534ec829e6d2154bb4bc9cfb8fd4dbe2d342422e852430d03d7ffc27910`.
+Both record clean source HEAD `f4ef1803d0c7778c2c813a68d3265469820a0520`;
+this subsequent handoff update changes documentation only. The installed initramfs
+is `/boot/initrd.img-7.2.6-cmdp-rearm-production`, SHA-256
+`112c7c7467862797f8fd363ef89b643e1000dde16ee18f7bc8ec91b078e2cf79`.
+
+The user chooses GRUB and reboots. Native tests
 must not run until a fresh postboot audit confirms the candidate's running GNU
 build ID against the hash-validated `vmlinux`, not merely its release string.
 
