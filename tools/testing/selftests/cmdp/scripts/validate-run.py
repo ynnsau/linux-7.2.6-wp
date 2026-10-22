@@ -132,6 +132,36 @@ def validate(path, minimum=1, compute_seconds=0):
                 errors.append('Qualification run admitted no pages; admission test is vacuous')
             if admissions > dirty_final.get('qualified', 0):
                 errors.append('Admissions exceed qualified observation epochs')
+    diagnostic_records = sorted((x for x in records if x.get('event') == 'diagnostics'),
+                                key=lambda x: x.get('now_ns', 0))
+    previous_diagnostic = None
+    for record in diagnostic_records:
+        rejected = record.get('rejected', {})
+        sources = record.get('invalidation_sources', {})
+        if not rejected or sum(rejected.values()) != record.get('unknown'):
+            errors.append('Exclusive sampling rejection reasons do not sum to unknown')
+        cumulative = {'unknown': record.get('unknown', 0),
+                      'trace_records': record.get('trace_records', 0),
+                      'trace_records_dropped': record.get('trace_records_dropped', 0)}
+        cumulative.update(('rejected.' + key, value) for key, value in rejected.items())
+        for name, source in sources.items():
+            cumulative.update(('source.' + name + '.' + key, value) for key, value in source.items())
+            if source.get('max_ns', 0) > source.get('elapsed_ns', 0):
+                errors.append('Invalidation maximum exceeds total duration: ' + name)
+        if previous_diagnostic:
+            for key, value in cumulative.items():
+                if value < previous_diagnostic.get(key, 0):
+                    errors.append('Diagnostic cumulative counter decreased: ' + key)
+        previous_diagnostic = cumulative
+    diagnostic_final = diagnostic_records[-1] if diagnostic_records else {}
+    if diagnostic_final and final:
+        sources = diagnostic_final.get('invalidation_sources', {})
+        if sum(x.get('arm_revoked', 0) for x in sources.values()) != final.get('terminals', {}).get('invalidate', 0):
+            errors.append('Final invalidation sources do not account for every invalidated ARM generation')
+        if progress and sum(x.get('calls', 0) for x in sources.values()) != progress[-1].get('range_calls', 0):
+            errors.append('Final invalidation source calls do not match completed range callbacks')
+        if dirty_final and diagnostic_final.get('unknown') != dirty_final.get('unknown'):
+            errors.append('Final diagnostic unknown differs from stopped dirty sampling total')
     log = (path / 'target.log').read_text(errors='replace') if (path / 'target.log').exists() else ''
     trials = [float(x) for x in re.findall(r'Trial Time:\s*([0-9.eE+-]+)', log)]
     if compute_seconds and sum(trials) < compute_seconds:
@@ -144,7 +174,7 @@ def validate(path, minimum=1, compute_seconds=0):
         'final_state_known': len(finals) == 1, 'last_observed': observed,
         'observation_end': observations[-1] if observations else {},
         'progress': progress[-1] if progress else {},
-        'dirty': dirty_final,
+        'dirty': dirty_final, 'diagnostics': diagnostic_final,
         'stop_request': stop_requests[-1] if stop_requests else {},
         'stop_return': stop_returns[-1] if stop_returns else {},
         'trial_count': len(trials), 'total_trial_seconds': sum(trials), 'final': final,

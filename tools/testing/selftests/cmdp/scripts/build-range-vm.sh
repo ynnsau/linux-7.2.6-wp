@@ -1,9 +1,10 @@
 #!/bin/bash
 # Build a disposable initramfs; no host kernel/module installation.
 set -euo pipefail
-src=${1:?Usage: build-range-vm.sh SOURCE NEW_OUTPUT_DIR BFS_BINARY}
+src=${1:?Usage: build-range-vm.sh SOURCE NEW_OUTPUT_DIR BFS_BINARY [PR_BINARY]}
 out=${2:?A new output directory is required}
 bfs=${3:?A verified GAPBS BFS binary is required}
+pr=${4:-}
 cc=${CC:-gcc-13}
 busybox=${BUSYBOX:-/bin/busybox}
 test ! -e "$out" || { echo "Refusing existing output directory: $out" >&2; exit 2; }
@@ -16,15 +17,21 @@ mkdir -p "$stage"/{bin,sbin,etc,proc,sys,dev,tmp,tests,run} "$out/headers/linux"
 cp "$src/include/uapi/linux/cmdp.h" "$out/headers/linux/"
 cp "$busybox" "$stage/bin/busybox"
 ln -s busybox "$stage/bin/sh"
-for name in cmdp_test cmdp_monitor_test cmdp_range_test cmdp_dirty_test cmdp_monitor cmdp_fixture; do
+for name in cmdp_test cmdp_monitor_test cmdp_range_test cmdp_dirty_test cmdp_recovery_test cmdp_monitor cmdp_fixture; do
     "$cc" -static -O2 -Wall -Wextra -Werror -pthread -I"$out/headers" \
         "$src/tools/testing/selftests/cmdp/$name.c" -o "$stage/tests/$name"
 done
 cp "$bfs" "$stage/tests/bfs"
+binaries=("$bfs")
+if test -n "$pr"; then
+    test -x "$pr"
+    cp "$pr" "$stage/tests/pr"
+    binaries+=("$pr")
+fi
 while read -r lib; do
     mkdir -p "$stage$(dirname "$lib")"
     cp -L "$lib" "$stage$lib"
-done < <(ldd "$bfs" | awk '/=> \/|^[ \t]*\// { for(i=1;i<=NF;i++) if($i ~ /^\//) print $i }')
+done < <(ldd "${binaries[@]}" | awk '/=> \/|^[ \t]*\// { for(i=1;i<=NF;i++) if($i ~ /^\//) print $i }')
 cat > "$out/console-drain.c" <<'DRAIN'
 #include <fcntl.h>
 #include <termios.h>
@@ -38,7 +45,8 @@ DRAIN
 "$cc" -static -O2 -Wall -Wextra -Werror "$out/console-drain.c" -o "$stage/tests/console-drain"
 cp "$src/tools/testing/selftests/cmdp/scripts/range-vm-init.sh" "$stage/init"
 cp "$src/tools/testing/selftests/cmdp/scripts/dirty-vm-tests.sh" "$stage/tests/dirty-vm-tests.sh"
-chmod +x "$stage/tests/dirty-vm-tests.sh"
+cp "$src/tools/testing/selftests/cmdp/scripts/recovery-vm-tests.sh" "$stage/tests/recovery-vm-tests.sh"
+chmod +x "$stage/tests/dirty-vm-tests.sh" "$stage/tests/recovery-vm-tests.sh"
 chmod +x "$stage/init"
 (cd "$stage" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -1) > "$out/initramfs.cpio.gz"
 sha256sum "$stage"/tests/* "$out/initramfs.cpio.gz" > "$out/inputs.sha256"

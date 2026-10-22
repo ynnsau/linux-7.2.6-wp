@@ -70,11 +70,14 @@ for name, block in blocks.items():
     result=validator.validate(out, minimum=1)
     local_errors=list(result['errors'])
     if block['exit']!=0: local_errors.append('Controller block exit is not zero')
-    if 'bfs' in name:
+    if name.startswith('recovery-') and not result.get('diagnostics'):
+        local_errors.append('Recovery workload lacks invalidation/sampling diagnostics')
+    if 'bfs' in name or name.startswith('recovery-pr'):
         marks=re.findall(r'Verification:\s*(PASS|FAIL)',target)
         trials=re.findall(r'Trial Time:\s*[0-9.eE+-]+',target)
-        if marks!=['PASS']*8 or len(trials)!=8: local_errors.append('Expected exactly 8 verified BFS trials')
-        result['bfs_verifications']=len(marks); result['bfs_trials']=len(trials)
+        if marks!=['PASS']*8 or len(trials)!=8: local_errors.append('Expected exactly 8 verified generated graph trials')
+        application='pr' if name.startswith('recovery-pr') else 'bfs'
+        result[application+'_verifications']=len(marks); result[application+'_trials']=len(trials)
     if name in ('hotcold','concurrent','churn'):
         if re.findall(r'fixture_validation=(PASS|FAIL)',target)!=['PASS']:
             local_errors.append('Expected one fixture validation PASS')
@@ -93,6 +96,35 @@ if suite=='dirty':
 elif suite=='small':
     require(set(blocks)=={'hotcold','concurrent','churn','bfs'},'Missing small workload blocks')
     require(len(taps)>=2 and taps[0]['planned']==18 and taps[1]['planned']==59,'Missing legacy regression tests')
+elif suite in ('recovery-baseline','recovery','recovery-numa'):
+    expected_taps=4 if suite=='recovery-numa' else 2
+    require(len(taps)==expected_taps,'Missing recovery thread/topology TAP cases')
+    configurations=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_RECOVERY_CONFIG ')]
+    require(len(configurations)==expected_taps,'Missing recovery fixture configurations')
+    if suite=='recovery-baseline':
+        require(not blocks,'Baseline reproduction unexpectedly ran workloads')
+        require(sorted(x.get('threads') for x in configurations)==['1','4'],'Missing one/four-thread baseline')
+        require(all(x.get('expected')=='stranded' for x in configurations),'Baseline must explicitly expect failure')
+        require(sum(x.strip()=='CMDP_RECOVERY_EXPECTED_FAILURE_REPRODUCED stranded=yes' for x in lines)==2,
+                'Missing deterministic pre-fix stranded evidence')
+    elif suite=='recovery':
+        require(set(blocks)=={'recovery-bfs1','recovery-bfs4','recovery-pr1','recovery-pr4'},'Missing recovery BFS/PR correctness matrix')
+        require(sorted(x.get('threads') for x in configurations)==['1','4'],'Missing one/four-thread recovery')
+        require(all(x.get('expected')=='recovered' for x in configurations),'Fixed suite must use strict recovered expectation')
+        require(sum(x.strip()=='CMDP_RECOVERY_FIXED_VERIFIED recovered=yes' for x in lines)==2,
+                'Missing strict fixed-behavior evidence')
+        pages=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_RECOVERY_PAGE ')]
+        for stage in ('armed','invalidated','first-observation','recovered','saved-dirty-untracked','saved-dirty-primed'):
+            require(sum(x.get('stage')==stage for x in pages)==2,'Missing page evidence: '+stage)
+        recovered=[x for x in pages if x.get('stage')=='recovered']
+        require(all(int(x['qualified_ns'])>=int(x['quiet_ns'])+200000000 for x in recovered),'Recovery reused old quiet age')
+    else:
+        require(not blocks,'NUMA fixture unexpectedly ran workloads')
+        events=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_RECOVERY_NUMA ')]
+        require({(x.get('threads'),x.get('cross_node')) for x in events}=={('1','0'),('1','1'),('4','0'),('4','1')},
+                'Missing local/cross-node one/four-thread NUMA cases')
+        require(all(int(x.get('calls',0))>0 and int(x.get('arm_revoked',0))>0 and x.get('recovered')=='1' for x in events),
+                'Actual NUMA invalidation did not revoke ARM in every case')
 stats={}
 for line in lines:
     m=re.fullmatch(r'(arms|publishes|revokes|waiters|rejects|entries|managed|isolated|stale|arm_ns|revoke_ns)\s+([0-9]+)',line.strip())
