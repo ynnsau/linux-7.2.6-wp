@@ -113,3 +113,24 @@ No matched unmonitored baseline is collected by this protocol. It does not claim
 end-to-end instrumentation overhead or compare unequal BFS/PR work as a speedup.
 The CMD-P write-helper timing remains a component measurement, not total fault or
 application overhead.
+
+## Historical comparison after completion
+
+Run analysis on a machine with matplotlib; the evidence can be copied with its
+checksum manifest without installing plotting dependencies on the test host.
+The comparison tool takes the completed recovery base and the preserved prior
+BFS/PR bases. It revalidates raw logs, applies the same sampled-zero-span method
+to both versions, and writes a shared-axis 2x2 live-ARM figure plus JSON/Markdown:
+
+```sh
+python3 -B scripts/compare-recovery-native.py \
+  --new RECOVERY_BASE --old-bfs HISTORICAL_BFS_BASE --old-pr HISTORICAL_PR_BASE \
+  --scripts-dir scripts --output NEW_EMPTY_COMPARISON_DIRECTORY
+```
+
+First run `analyze-recovery-native.py RECOVERY_BASE` to populate its
+`recovery-analysis` directory. Historical bases retain their original
+`analysis/analysis.json` files. Mean protected GiB uses the kernel integral
+divided by monitor attachment through final status, including startup/cleanup.
+The figure labels unequal trial counts and does not extrapolate an ended run.
+This comparison does not establish overhead or a causal performance effect.
