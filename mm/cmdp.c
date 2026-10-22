@@ -1299,12 +1299,25 @@ static unsigned int cmdp_unknown_pte(pte_t pte)
 	}
 }
 
-/* Ordinary RW only: pte_write() also accepts CET shadow-stack encodings. */
+/* Ordinary RW and RO only. Raw RO+D is a CET shadow-stack encoding;
+ * pte_write() intentionally accepts it and therefore cannot be used here.
+ * RW stores dirty evidence in D; ordinary RO preserves it in SAVED_DIRTY.
+ * No permission is restored: the VMA, exclusive folio and final PTE checks
+ * remain mandatory, and an unowned RO mapping must establish a fresh epoch.
+ */
 static bool cmdp_dirty_pte_supported(pte_t pte)
 {
-	return pte_present(pte) && !pte_protnone(pte) &&
-		(pte_flags(pte) & _PAGE_RW) &&
-		!(pte_flags(pte) & _PAGE_SAVED_DIRTY);
+	if (!pte_present(pte) || pte_protnone(pte))
+		return false;
+	return (pte_flags(pte) & _PAGE_RW) ?
+		!(pte_flags(pte) & _PAGE_SAVED_DIRTY) :
+		!(pte_flags(pte) & _PAGE_DIRTY);
+}
+
+static unsigned int cmdp_dirty_pte_bit(pte_t pte)
+{
+	return (pte_flags(pte) & _PAGE_RW) ?
+		_PAGE_BIT_DIRTY : _PAGE_BIT_SAVED_DIRTY;
 }
 
 static bool cmdp_dirty_admit(struct cmdp_entry *e, pte_t pte)
@@ -1654,8 +1667,8 @@ static int cmdp_monitor_probe(struct cmdp_session *s, unsigned long addr,
 /* Return 1 only for a clean, qualified candidate; 0 means keep observing.
  * CMDP is native X86_64 (!XEN_PV). No generic PTE replacement is used here:
  * locked bit-test-and-reset preserves A, permissions, PFN and software bits
- * while hardware can update A/D concurrently. The ordinary RW/saved-dirty
- * checks above make _PAGE_BIT_DIRTY the sole supported dirty encoding.
+ * while hardware can update A/D concurrently. The predicate above excludes
+ * CET/inconsistent encodings; RW uses D and ordinary RO uses SAVED_DIRTY.
  *
  * The folio lock excludes reclaim/migration until epoch publication. mmap
  * write plus vma_start_write excludes mapping changes and per-VMA faults.
@@ -1739,11 +1752,15 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 	if (reset) {
 		u64 before = ktime_get_ns();
 
-		/* Preserve Linux dirty/reclaim accounting before discarding D.
-		 * Conservative marking also covers a store racing the initial read.
+		/* Preserve Linux dirty/reclaim accounting before harvesting D/SD.
+		 * PTL stabilizes RW vs RO. Clear only its matching dirty bit: never
+		 * erase raw RO+D, including a hardware-set D racing this read.
+		 * Such an encoding is rejected on the next probe/final admission.
+		 * A store to ordinary RO must fault; Linux transfers SD to D when
+		 * it makes the PTE writable, so a later write resets quiet evidence.
 		 */
 		folio_mark_dirty(folio);
-		dirty |= test_and_clear_bit(_PAGE_BIT_DIRTY,
+		dirty |= test_and_clear_bit(cmdp_dirty_pte_bit(pte),
 					   (unsigned long *)&pvmw.pte->pte);
 		reset_ns = ktime_get_ns() - before;
 		before = ktime_get_ns();
@@ -2388,6 +2405,42 @@ put:
 }
 
 #ifdef CONFIG_CMDP_TEST
+/* Exercise the actual admission/harvesting helpers on a local scalar only.
+ * Unsupported/CET encodings are never installed in an application PTE.
+ */
+static long cmdp_monitor_test_pte(void __user *up)
+{
+	struct cmdp_monitor_test_pte req;
+	pteval_t bits = 0;
+	pte_t pte;
+
+	if (copy_from_user(&req, up, sizeof(req)))
+		return -EFAULT;
+	if (req.size != sizeof(req) || req.version != CMDP_MONITOR_VERSION ||
+	    (req.flags & ~CMDP_MON_TEST_PTE_MASK) ||
+	    ((req.flags & CMDP_MON_TEST_PTE_PRESENT) &&
+	     (req.flags & CMDP_MON_TEST_PTE_PROTNONE)))
+		return -EINVAL;
+	if (req.flags & CMDP_MON_TEST_PTE_PRESENT) bits |= _PAGE_PRESENT;
+	if (req.flags & CMDP_MON_TEST_PTE_RW) bits |= _PAGE_RW;
+	if (req.flags & CMDP_MON_TEST_PTE_DIRTY) bits |= _PAGE_DIRTY;
+	if (req.flags & CMDP_MON_TEST_PTE_SAVED_DIRTY) bits |= _PAGE_SAVED_DIRTY;
+	if (req.flags & CMDP_MON_TEST_PTE_PROTNONE) bits |= _PAGE_PROTNONE;
+	pte = __pte(bits);
+	req.supported = cmdp_dirty_pte_supported(pte);
+	req.dirty = pte_dirty(pte);
+	if (req.supported)
+		__clear_bit(cmdp_dirty_pte_bit(pte), (unsigned long *)&pte.pte);
+	bits = pte_flags(pte);
+	req.cleared_flags = 0;
+	if (bits & _PAGE_PRESENT) req.cleared_flags |= CMDP_MON_TEST_PTE_PRESENT;
+	if (bits & _PAGE_RW) req.cleared_flags |= CMDP_MON_TEST_PTE_RW;
+	if (bits & _PAGE_DIRTY) req.cleared_flags |= CMDP_MON_TEST_PTE_DIRTY;
+	if (bits & _PAGE_SAVED_DIRTY) req.cleared_flags |= CMDP_MON_TEST_PTE_SAVED_DIRTY;
+	if (bits & _PAGE_PROTNONE) req.cleared_flags |= CMDP_MON_TEST_PTE_PROTNONE;
+	return copy_to_user(up, &req, sizeof(req)) ? -EFAULT : 0;
+}
+
 static long cmdp_monitor_test_invalidate(struct cmdp_monitor *m, void __user *up)
 {
 	struct cmdp_monitor_test_invalidate req;
@@ -2502,6 +2555,8 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 #ifdef CONFIG_CMDP_TEST
+	if (cmd == CMDP_MON_TEST_PTE)
+		return cmdp_monitor_test_pte(up);
 	if (cmd == CMDP_MON_TEST_HOLD_MMAP)
 		return cmdp_monitor_test_hold_mmap(m, up);
 	if (cmd == CMDP_MON_TEST_INVALIDATE)

@@ -258,4 +258,22 @@ struct cmdp_monitor_test_invalidate {
 #define CMDP_MON_PAGE_SNAPSHOT _IOWR(CMDP_IOC_MAGIC, 29, struct cmdp_monitor_page_snapshot)
 #define CMDP_MON_TEST_INVALIDATE _IOW(CMDP_IOC_MAGIC, 30, struct cmdp_monitor_test_invalidate)
 
+/* CONFIG_CMDP_TEST only. Abstract flag selectors for a local scalar PTE test;
+ * no process PTE is read or written. Output reports the real sampler predicate
+ * and clearing of only the encoding's selected D/SD bit when supported.
+ */
+#define CMDP_MON_TEST_PTE_PRESENT (1ULL << 0)
+#define CMDP_MON_TEST_PTE_RW (1ULL << 1)
+#define CMDP_MON_TEST_PTE_DIRTY (1ULL << 2)
+#define CMDP_MON_TEST_PTE_SAVED_DIRTY (1ULL << 3)
+#define CMDP_MON_TEST_PTE_PROTNONE (1ULL << 4)
+#define CMDP_MON_TEST_PTE_MASK ((1ULL << 5) - 1)
+struct cmdp_monitor_test_pte {
+	__u32 size, version;
+	__u64 flags;
+	__u32 supported, dirty;
+	__u64 cleared_flags;
+};
+#define CMDP_MON_TEST_PTE _IOWR(CMDP_IOC_MAGIC, 31, struct cmdp_monitor_test_pte)
+
 #endif /* _UAPI_LINUX_CMDP_H */
