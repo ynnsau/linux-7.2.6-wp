@@ -153,10 +153,10 @@ def verified_record(expected_sha):
         # Do not silently accept a recorded older pass if a newer attempt
         # exists and failed. Numeric versions make v10 newer than v9.
         versions = []
-        for candidate in BUILD_RUN.glob(prefix + '-' + suite + '-v*/validation.json'):
-            match = pattern.fullmatch(candidate.parent.name)
-            if match:
-                versions.append((int(match.group(1)), candidate))
+        for directory in BUILD_RUN.glob(prefix + '-' + suite + '-v*'):
+            match = pattern.fullmatch(directory.name)
+            if directory.is_dir() and match:
+                versions.append((int(match.group(1)), directory / 'validation.json'))
         check(key + ':latest', bool(versions) and max(versions)[1] == path)
         report = json.loads(path.read_text())
         vm = path.parent

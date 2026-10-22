@@ -54,10 +54,10 @@ def latest_vm(prefix, suite):
     # latest runs visible: never silently select an older passing run.
     pattern = re.compile(re.escape(prefix + '-' + suite) + r'-v([0-9]+)')
     candidates = []
-    for path in run.glob(prefix + '-' + suite + '-v*/validation.json'):
-        match = pattern.fullmatch(path.parent.name)
-        if match:
-            candidates.append((int(match.group(1)), path))
+    for directory in run.glob(prefix + '-' + suite + '-v*'):
+        match = pattern.fullmatch(directory.name)
+        if directory.is_dir() and match:
+            candidates.append((int(match.group(1)), directory / 'validation.json'))
     require(bool(candidates), 'Missing ' + prefix + ' VM suite ' + suite)
     return max(candidates)[1] if candidates else None
 
@@ -65,6 +65,9 @@ def verify_vm(prefix, suite, kernel, expected_image_hash):
     path = latest_vm(prefix, suite)
     if path is None:
         return {}
+    if not path.is_file():
+        require(False, 'Newest VM attempt lacks validation: ' + str(path.parent))
+        return {'path': str(path), 'pass': False}
     report = json_record(path, prefix + ' ' + suite + ' validation')
     vm = path.parent
     label = prefix + ' ' + suite
