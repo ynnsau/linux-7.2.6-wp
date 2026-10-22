@@ -31,7 +31,8 @@ fi
 while read -r lib; do
     mkdir -p "$stage$(dirname "$lib")"
     cp -L "$lib" "$stage$lib"
-done < <(ldd "${binaries[@]}" | awk '/=> \/|^[ \t]*\// { for(i=1;i<=NF;i++) if($i ~ /^\//) print $i }')
+done < <(for binary in "${binaries[@]}"; do ldd "$binary"; done |
+    awk '/=> \/|^[ \t]*\// { for(i=1;i<=NF;i++) if($i ~ /^\//) print $i }' | sort -u)
 cat > "$out/console-drain.c" <<'DRAIN'
 #include <fcntl.h>
 #include <termios.h>
