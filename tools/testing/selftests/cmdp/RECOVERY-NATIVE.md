@@ -20,7 +20,7 @@ paths. Select a new `--base` directory. Preparation validates current release,
 build identity, boot ID, ownership cleanup, clean source, same stock GAPBS source,
 BFS/PR binaries and the exact directed Twitter dimensions. It hashes the complete
 Twitter graph and requires the original study SHA-256
-`4b7e5193a8e3384b8319359dc8c92534b8aee8e48d6c3bd0820451bb307d6eea`; it and compiles seven fresh tools, including `cmdp_recovery_test`.
+`4b7e5193a8e3384b8319359dc8c92534b8aee8e48d6c3bd0820451bb307d6eea`. It compiles seven fresh tools, including `cmdp_recovery_test`.
 The final `postboot-audit.json` has `recovery_ready=true` only after all work passes.
 A prior boot's audit or fixture receipt is never reusable.
 
