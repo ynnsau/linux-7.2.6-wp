@@ -3,6 +3,8 @@
 See [PLAN.md](PLAN.md) for the consolidated research plan, source map,
 prototype scope, and measurement milestones. The original goals follow.
 
+The [matched GAPBS overhead report](matched-gapbs-overhead-20261022/README.md) records 144 successful fixed-work runs across BFS, PR, CC and BC, with one/four threads and six repeats of off, sampling-only and dirty→ARM modes. It includes end-to-end runtime, paired overhead, ARM/RSS figures, repeat-level data and the reproducible analyzer.
+
 The restricted, manually armed kernel v1 is implemented; its architecture,
 test interface, scope, and validation are recorded in the
 [CMD-P selftest README](../tools/testing/selftests/cmdp/README.md). The plan
