@@ -4,8 +4,9 @@
 measurement tools are committed and pushed. The baseline reproducer, all six
 debug suites and all six production suites passed. The full kernel and 5,072
 modules were built and installed as **`7.2.6-cmdp-rearm-production`**. Installation
-verification passed all 366 checks. GRUB is unchanged and no reboot was performed;
-BMP still runs `7.2.6-cmdp-dirty-production`. The user subsequently booted this kernel and the
+verification passed all 366 checks. At installation, GRUB was unchanged and
+BMP remained on `7.2.6-cmdp-dirty-production` without an agent-initiated reboot.
+The user subsequently booted the recovery kernel and the
 [native recovery matrix passed](native-recovery-results-20261022.md).
 
 ## Problem and resulting behavior
