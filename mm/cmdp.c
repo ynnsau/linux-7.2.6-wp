@@ -150,6 +150,7 @@ struct cmdp_monitor {
 	struct cmdp_monitor_status status;
 	struct cmdp_monitor_progress progress;
 	struct cmdp_monitor_dirty_status dirty;
+	struct cmdp_monitor_diagnostics diagnostics;
 	struct cmdp_cohort *current_cohort;
 	u64 next_lifetime;
 	u64 account_ns;
@@ -163,6 +164,8 @@ static void cmdp_monitor_terminal(struct cmdp_entry *e, const char *reason);
 static void cmdp_monitor_armed(struct cmdp_entry *e);
 static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
 		unsigned long start, unsigned long end);
+static void cmdp_monitor_invalidate_history_count(struct cmdp_session *s,
+		unsigned long start, unsigned long end, u64 *observations, u64 *histories);
 static void cmdp_monitor_mark_stop(struct cmdp_monitor *m, unsigned int reason);
 static void cmdp_monitor_snapshot_stop(struct cmdp_monitor *m);
 static void cmdp_dirty_invalidate_locked(struct cmdp_monitor *m,
@@ -377,7 +380,7 @@ static void cmdp_finish(struct cmdp_entry *e, const char *reason)
 	cmdp_put(e); /* session address index */
 }
 
-static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
+static int cmdp_revoke_counted(struct cmdp_entry *e, const char *reason, bool *owner)
 {
 	int state, ret;
 	u64 start;
@@ -386,7 +389,7 @@ static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
 	if (state == CMDP_ARMING) {
 		/* Only session shutdown can join arming; faults cannot get here. */
 		wait_for_completion(&e->arm_done);
-		return cmdp_revoke(e, reason);
+		return cmdp_revoke_counted(e, reason, owner);
 	}
 	if (state != CMDP_ACTIVE) {
 		if (state == CMDP_REVOKING) {
@@ -398,6 +401,8 @@ static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
 		return 0;
 	}
 
+	if (owner)
+		*owner = true;
 	start = ktime_get_ns();
 	trace_cmdp_event(e->pfn, e->generation, CMDP_ACTIVE, CMDP_REVOKING,
 			reason, e->protected, 0);
@@ -411,6 +416,11 @@ static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
 	cmdp_finish(e, reason);
 	atomic64_add(ktime_get_ns() - start, &cmdp_stats[REVOKE_NS]);
 	return 0;
+}
+
+static int cmdp_revoke(struct cmdp_entry *e, const char *reason)
+{
+	return cmdp_revoke_counted(e, reason, NULL);
 }
 
 int cmdp_prepare_write(struct cmdp_entry *e)
@@ -492,19 +502,71 @@ static u64 cmdp_range_begin(struct cmdp_session *s)
 	return now;
 }
 
-static void cmdp_range_end(struct cmdp_session *s, u64 start)
+/* These addresses are diagnostic labels, never session identities. The event
+ * remains PROTECTION_VMA, so the own-PROTECTION_PAGE exemption cannot match.
+ */
+static char cmdp_numa_owner, cmdp_protection_token, cmdp_test_owner;
+
+void *cmdp_protection_owner(bool prot_numa)
+{
+	return prot_numa ? &cmdp_numa_owner : &cmdp_protection_token;
+}
+
+static unsigned int cmdp_invalidation_source(const struct mmu_notifier_range *range)
+{
+	if (range->event == MMU_NOTIFY_PROTECTION_VMA) {
+		if (range->owner == &cmdp_numa_owner)
+			return CMDP_MON_SOURCE_NUMA;
+		if (range->owner == &cmdp_protection_token)
+			return CMDP_MON_SOURCE_PROTECTION;
+		if (range->owner == &cmdp_test_owner)
+			return CMDP_MON_SOURCE_TEST;
+	}
+	if (range->event == MMU_NOTIFY_UNMAP)
+		return CMDP_MON_SOURCE_UNMAP;
+	if (range->event == MMU_NOTIFY_CLEAR)
+		return CMDP_MON_SOURCE_CLEAR;
+	return CMDP_MON_SOURCE_UNKNOWN;
+}
+
+static void cmdp_range_end(struct cmdp_session *s, u64 start,
+		unsigned int source, unsigned long lo, unsigned long hi,
+		u64 revoked, u64 observations, u64 histories, int error)
 {
 	struct cmdp_monitor *m = s->monitor;
+	struct cmdp_monitor_invalidation_stats *d;
 	unsigned long flags;
-	u64 elapsed = ktime_get_ns() - start;
+	u64 elapsed = ktime_get_ns() - start, session_id = 0;
+	bool emit = false;
 
 	if (m) {
 		spin_lock_irqsave(&m->lock, flags);
 		m->progress.range_inflight--;
 		m->progress.range_ns += elapsed;
 		m->progress.range_max_ns = max(m->progress.range_max_ns, elapsed);
+		if (source >= CMDP_MON_NR_SOURCES)
+			source = CMDP_MON_SOURCE_UNKNOWN;
+		d = &m->diagnostics.source[source];
+		d->calls++;
+		d->arm_revoked += revoked;
+		d->observations_reset += observations;
+		d->histories_reset += histories;
+		d->elapsed_ns += elapsed;
+		d->max_ns = max(d->max_ns, elapsed);
+		if (trace_cmdp_invalidation_enabled()) {
+			if (m->diagnostics.trace_records < 4096) {
+				m->diagnostics.trace_records++;
+				emit = true;
+			} else {
+				m->diagnostics.trace_records_dropped++;
+			}
+		}
+		session_id = m->status.session_id;
 		spin_unlock_irqrestore(&m->lock, flags);
 	}
+	if (emit)
+		trace_cmdp_invalidation(session_id, source, lo, hi, revoked,
+				observations, histories, elapsed, error);
 }
 
 static int cmdp_invalidate(struct mmu_notifier *mn,
@@ -512,7 +574,8 @@ static int cmdp_invalidate(struct mmu_notifier *mn,
 {
 	struct cmdp_session *s = container_of(mn, struct cmdp_session, notifier);
 	struct cmdp_entry *e;
-	u64 start;
+	u64 start, revoked = 0, observations = 0, histories = 0;
+	bool owner;
 	int ret = 0;
 
 	/* Our own alias protection notification, outside PTL/rmap locks. */
@@ -520,7 +583,8 @@ static int cmdp_invalidate(struct mmu_notifier *mn,
 		return 0;
 
 	start = cmdp_range_begin(s);
-	cmdp_monitor_invalidate_history(s, range->start, range->end);
+	cmdp_monitor_invalidate_history_count(s, range->start, range->end,
+					      &observations, &histories);
 	while ((e = cmdp_find_range(s, range->start, range->end))) {
 		if (!mmu_notifier_range_blockable(range)) {
 			cmdp_put(e);
@@ -532,7 +596,9 @@ static int cmdp_invalidate(struct mmu_notifier *mn,
 		 * LRU isolation and v1 exclusions prevent overlapping rmap-driven
 		 * migration/reclaim. BLOCKABLE alone is not sufficient for those.
 		 */
-		ret = cmdp_revoke(e, "invalidate");
+		owner = false;
+		ret = cmdp_revoke_counted(e, "invalidate", &owner);
+		revoked += owner;
 		if (ret) {
 			/* Blockable invalidation cannot veto destruction. Fail closed. */
 			wait_for_completion(&e->terminal);
@@ -541,7 +607,8 @@ static int cmdp_invalidate(struct mmu_notifier *mn,
 		cmdp_put(e);
 		cond_resched();
 	}
-	cmdp_range_end(s, start);
+	cmdp_range_end(s, start, cmdp_invalidation_source(range),
+		       range->start, range->end, revoked, observations, histories, ret);
 	return ret;
 }
 
@@ -1182,6 +1249,56 @@ static void cmdp_dirty_invalidate_locked(struct cmdp_monitor *m,
 	h->observation_seq++;
 }
 
+/* All callers hold m->lock. One reason for every increment of unknown. */
+static void cmdp_dirty_unknown(struct cmdp_monitor *m, unsigned int reason)
+{
+	if (WARN_ON_ONCE(reason >= CMDP_MON_NR_UNKNOWNS))
+		reason = CMDP_MON_UNKNOWN_OTHER;
+	m->dirty.unknown++;
+	m->diagnostics.rejected[reason]++;
+}
+
+static unsigned int cmdp_unknown_skip(int skip)
+{
+	switch (skip) {
+	case CMDP_MON_SKIP_NONRESIDENT: return CMDP_MON_UNKNOWN_NONRESIDENT;
+	case CMDP_MON_SKIP_SWAPPED: return CMDP_MON_UNKNOWN_SWAPPED;
+	case CMDP_MON_SKIP_BUSY: return CMDP_MON_UNKNOWN_PROTNONE;
+	case CMDP_MON_SKIP_PAGE_TYPE: return CMDP_MON_UNKNOWN_PAGE_TYPE;
+	case CMDP_MON_SKIP_ALIASES: return CMDP_MON_UNKNOWN_ALIASES;
+	case CMDP_MON_SKIP_PINS: return CMDP_MON_UNKNOWN_PINS;
+	case CMDP_MON_SKIP_RESOURCE: return CMDP_MON_UNKNOWN_RESOURCE;
+	default: return CMDP_MON_UNKNOWN_OTHER;
+	}
+}
+
+static unsigned int cmdp_pte_category(pte_t pte)
+{
+	if (pte_protnone(pte))
+		return CMDP_MON_PTE_PROTNONE;
+	if (!pte_present(pte))
+		return CMDP_MON_PTE_NONRESIDENT;
+	/* Raw D without RW is the CET shadow-stack encoding, unlike the
+	 * software saved-dirty bit used by ordinary write protection.
+	 */
+	if (!(pte_flags(pte) & _PAGE_RW) && (pte_flags(pte) & _PAGE_DIRTY))
+		return CMDP_MON_PTE_SHADOW_STACK;
+	if (pte_flags(pte) & _PAGE_SAVED_DIRTY)
+		return CMDP_MON_PTE_SAVED_DIRTY;
+	return (pte_flags(pte) & _PAGE_RW) ? CMDP_MON_PTE_WRITABLE : CMDP_MON_PTE_READONLY;
+}
+
+static unsigned int cmdp_unknown_pte(pte_t pte)
+{
+	switch (cmdp_pte_category(pte)) {
+	case CMDP_MON_PTE_NONRESIDENT: return CMDP_MON_UNKNOWN_NONRESIDENT;
+	case CMDP_MON_PTE_PROTNONE: return CMDP_MON_UNKNOWN_PROTNONE;
+	case CMDP_MON_PTE_READONLY: return CMDP_MON_UNKNOWN_READONLY;
+	case CMDP_MON_PTE_SAVED_DIRTY: return CMDP_MON_UNKNOWN_SAVED_DIRTY;
+	default: return CMDP_MON_UNKNOWN_PAGE_TYPE;
+	}
+}
+
 /* Ordinary RW only: pte_write() also accepts CET shadow-stack encodings. */
 static bool cmdp_dirty_pte_supported(pte_t pte)
 {
@@ -1308,8 +1425,8 @@ static void cmdp_monitor_terminal(struct cmdp_entry *e, const char *why)
 	spin_unlock_irqrestore(&m->lock, flags);
 }
 
-static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
-		unsigned long start, unsigned long end)
+static void cmdp_monitor_invalidate_history_count(struct cmdp_session *s,
+		unsigned long start, unsigned long end, u64 *observations, u64 *histories)
 {
 	struct cmdp_monitor *m = s->monitor;
 	struct cmdp_history *h;
@@ -1323,12 +1440,17 @@ static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
 	xa_for_each_range(&m->history, index, h, start >> PAGE_SHIFT,
 			  (end - 1) >> PAGE_SHIFT) {
 		spin_lock_irqsave(&m->lock, flags);
-		if (h->dirty.valid)
+		if (h->dirty.valid) {
 			m->dirty.invalidations++;
+			if (observations)
+				(*observations)++;
+		}
 		cmdp_dirty_invalidate_locked(m, h);
 		if (h->continuous) {
 			h->continuous = false;
 			m->status.history_resets++;
+			if (histories)
+				(*histories)++;
 		}
 		if (h->page.state != CMDP_MON_PAGE_ARMED &&
 		    h->page.state != CMDP_MON_PAGE_STOPPED) {
@@ -1336,6 +1458,12 @@ static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
 		}
 		spin_unlock_irqrestore(&m->lock, flags);
 	}
+}
+
+static void cmdp_monitor_invalidate_history(struct cmdp_session *s,
+		unsigned long start, unsigned long end)
+{
+	cmdp_monitor_invalidate_history_count(s, start, end, NULL, NULL);
 }
 
 static struct cmdp_session *cmdp_session_for_mm(struct mm_struct *mm)
@@ -1356,11 +1484,13 @@ static struct cmdp_session *cmdp_session_for_mm(struct mm_struct *mm)
 /* Lifecycle callers already exclude new ARM through mmap write locking.
  * Never take commands or join the worker from these paths.
  */
-int cmdp_mm_modify(struct mm_struct *mm, unsigned long start, unsigned long end)
+int cmdp_mm_modify(struct mm_struct *mm, unsigned long start, unsigned long end,
+		unsigned int source)
 {
 	struct cmdp_session *s;
 	struct cmdp_entry *e;
-	u64 begin;
+	u64 begin, revoked = 0, observations = 0, histories = 0;
+	bool owner;
 	int ret = 0;
 
 	mmap_assert_write_locked(mm);
@@ -1372,15 +1502,17 @@ int cmdp_mm_modify(struct mm_struct *mm, unsigned long start, unsigned long end)
 		goto out;
 	}
 	begin = cmdp_range_begin(s);
-	cmdp_monitor_invalidate_history(s, start, end);
+	cmdp_monitor_invalidate_history_count(s, start, end, &observations, &histories);
 	while ((e = cmdp_find_range(s, start, end))) {
-		ret = cmdp_revoke(e, "invalidate");
+		owner = false;
+		ret = cmdp_revoke_counted(e, "invalidate", &owner);
+		revoked += owner;
 		cmdp_put(e);
 		if (ret)
 			break;
 		cond_resched();
 	}
-	cmdp_range_end(s, begin);
+	cmdp_range_end(s, begin, source, start, end, revoked, observations, histories, ret);
 out:
 	cmdp_session_put(s);
 	return ret;
@@ -1543,26 +1675,46 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 	u64 start = ktime_get_ns(), seq, now, reset_ns = 0, flush_ns = 0;
 	bool resident, dirty, reset, valid;
 	int skip, ret = -EAGAIN;
+	unsigned int rejected = CMDP_MON_UNKNOWN_MAPPING;
 	pte_t pte;
 
 	mmap_assert_write_locked(vma->vm_mm);
 	vma_start_write(vma);
 	page = cmdp_monitor_get_page(vma, addr, &resident, &skip);
-	if (!page)
+	if (!page) {
+		rejected = cmdp_unknown_skip(skip);
 		goto unknown;
+	}
 	folio = page_folio(page);
-	if (page_to_pfn(page) != pfn || !folio_trylock(folio))
+	if (page_to_pfn(page) != pfn)
 		goto put;
+	if (!folio_trylock(folio)) {
+		rejected = CMDP_MON_UNKNOWN_FOLIO_BUSY;
+		goto put;
+	}
 	/* Revalidate the probe after acquiring the folio lock. Do not retain
 	 * page ownership between samples or change LRU/reclaim eligibility.
 	 */
 	if (folio_test_large(folio) || !folio_test_anon(folio) ||
 	    folio_test_ksm(folio) || folio_test_swapcache(folio) ||
 	    PageReserved(page) || is_zone_device_page(page) ||
-	    PageHWPoison(page) || !PageAnonExclusive(page) || PageCmdp(page) ||
-	    folio_mapcount(folio) != 1 || folio_maybe_dma_pinned(folio) ||
-	    folio_ref_count(folio) != folio_expected_ref_count(folio) + 1)
+	    PageHWPoison(page) || !PageAnonExclusive(page)) {
+		rejected = CMDP_MON_UNKNOWN_PAGE_TYPE;
 		goto unlock_folio;
+	}
+	if (PageCmdp(page)) {
+		rejected = CMDP_MON_UNKNOWN_OWNED;
+		goto unlock_folio;
+	}
+	if (folio_mapcount(folio) != 1) {
+		rejected = CMDP_MON_UNKNOWN_ALIASES;
+		goto unlock_folio;
+	}
+	if (folio_maybe_dma_pinned(folio) ||
+	    folio_ref_count(folio) != folio_expected_ref_count(folio) + 1) {
+		rejected = CMDP_MON_UNKNOWN_PINS;
+		goto unlock_folio;
+	}
 	pvmw = (struct page_vma_mapped_walk) {
 		.pfn = pfn, .nr_pages = 1, .pgoff = folio_pgoff(folio),
 		.vma = vma, .address = addr, .flags = PVMW_SYNC,
@@ -1572,8 +1724,11 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 	if (!pvmw.pte || pvmw.address != addr)
 		goto unlock_pte;
 	pte = ptep_get(pvmw.pte);
-	if (!cmdp_dirty_pte_supported(pte) ||
-	    vm_normal_page(vma, addr, pte) != page)
+	if (!cmdp_dirty_pte_supported(pte)) {
+		rejected = cmdp_unknown_pte(pte);
+		goto unlock_pte;
+	}
+	if (vm_normal_page(vma, addr, pte) != page)
 		goto unlock_pte;
 	dirty = pte_dirty(pte);
 	spin_lock_irqsave(&m->lock, flags);
@@ -1621,7 +1776,7 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 	}
 	if (seq != h->observation_seq) {
 		cmdp_dirty_invalidate_locked(m, h);
-		m->dirty.unknown++;
+		cmdp_dirty_unknown(m, CMDP_MON_UNKNOWN_SEQUENCE);
 		ret = 0;
 	} else if (reset) {
 		if (!h->dirty.valid)
@@ -1657,7 +1812,7 @@ put:
 unknown:
 	spin_lock_irqsave(&m->lock, flags);
 	cmdp_dirty_invalidate_locked(m, h);
-	m->dirty.unknown++;
+	cmdp_dirty_unknown(m, rejected);
 	m->dirty.sample_ns += ktime_get_ns() - start;
 	spin_unlock_irqrestore(&m->lock, flags);
 	return ret;
@@ -1853,7 +2008,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 				if (m->dirty.mode) {
 					cmdp_monitor_invalidate_history(s, addr, addr + PAGE_SIZE);
 					spin_lock_irqsave(&m->lock, flags);
-					m->dirty.unknown++;
+					cmdp_dirty_unknown(m, cmdp_unknown_skip(probe));
 					spin_unlock_irqrestore(&m->lock, flags);
 				}
 				goto next;
@@ -1871,7 +2026,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 				m->status.resource_failures++;
 				if (m->dirty.mode) {
 					m->dirty.resource_skips++;
-					m->dirty.unknown++;
+					cmdp_dirty_unknown(m, CMDP_MON_UNKNOWN_RESOURCE);
 				}
 				spin_unlock_irqrestore(&m->lock, flags);
 				goto next;
@@ -1922,7 +2077,7 @@ resource:
 			spin_lock_irqsave(&m->lock, flags);
 			if (m->dirty.mode) {
 				m->dirty.resource_skips++;
-				m->dirty.unknown++;
+				cmdp_dirty_unknown(m, CMDP_MON_UNKNOWN_RESOURCE);
 			}
 			c->report.skipped[CMDP_MON_SKIP_RESOURCE]++;
 			m->status.resource_failures++;
@@ -2119,7 +2274,172 @@ task_out:
 	return ret;
 }
 
+/* ctl pins the session; mmap/VMA write excludes mapping changes and faults.
+ * PTL and the registry then give a single-address ownership/PTE snapshot.
+ */
+static int cmdp_monitor_page_snapshot(struct cmdp_monitor *m,
+		struct cmdp_monitor_page_snapshot *out)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	struct cmdp_history *h;
+	struct cmdp_entry *e;
+	struct page *page;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+	unsigned long flags, addr = out->addr;
+	int ret = 0;
+
+	if (!m->session || !mmget_not_zero(m->session->mm))
+		return -ESRCH;
+	mm = m->session->mm;
+	if (!cmdp_mmap_write_trylock(mm)) {
+		ret = -EAGAIN;
+		goto put;
+	}
+	memset(out, 0, sizeof(*out));
+	out->size = sizeof(*out);
+	out->version = CMDP_MONITOR_VERSION;
+	out->addr = addr;
+	out->category = CMDP_MON_PTE_UNMAPPED;
+	vma = vma_lookup(mm, addr);
+	if (!vma)
+		goto history;
+	vma_start_write(vma);
+	out->category = CMDP_MON_PTE_NONRESIDENT;
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto history;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_leaf(*p4d))
+		goto unsupported;
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		goto history;
+	pud = pud_offset(p4d, addr);
+	if (pud_leaf(*pud))
+		goto unsupported;
+	if (pud_none(*pud) || pud_bad(*pud))
+		goto history;
+	pmd = pmd_offset(pud, addr);
+	if (pmd_leaf(*pmd))
+		goto unsupported;
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		goto history;
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep)
+		goto history;
+	pte = ptep_get(ptep);
+	out->pte_flags = pte_flags(pte);
+	out->category = cmdp_pte_category(pte);
+	page = pte_present(pte) ? vm_normal_page(vma, addr, pte) : NULL;
+	if (page) {
+		out->pfn = page_to_pfn(page);
+		e = cmdp_lookup(page);
+		if (e && !IS_ERR(e)) {
+			out->owned = e->session == m->session;
+			if (out->owned)
+				out->arm_generation = e->generation;
+			cmdp_put(e);
+		} else if (IS_ERR(e)) {
+			ret = PTR_ERR(e);
+		}
+	}
+	/* Sample history while PTE remains locked for the coherent normal-page
+	 * case. Other cases still have mmap/VMA exclusion, with no owned entry.
+	 */
+	spin_lock_irqsave(&m->lock, flags);
+	h = xa_load(&m->history, addr >> PAGE_SHIFT);
+	if (h) {
+		out->history_state = h->page.state;
+		out->observation_valid = h->dirty.valid;
+		out->epoch_id = h->dirty.epoch_id;
+		out->quiet_since_ns = h->dirty.quiet_since_ns;
+		out->last_sample_ns = h->dirty.last_sample_ns;
+		out->qualified_ns = h->dirty.qualified_ns;
+	}
+	out->now_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&m->lock, flags);
+	pte_unmap_unlock(ptep, ptl);
+	goto unlock;
+unsupported:
+	out->category = CMDP_MON_PTE_UNSUPPORTED;
+history:
+	spin_lock_irqsave(&m->lock, flags);
+	h = xa_load(&m->history, addr >> PAGE_SHIFT);
+	if (h) {
+		out->history_state = h->page.state;
+		out->observation_valid = h->dirty.valid;
+		out->epoch_id = h->dirty.epoch_id;
+		out->quiet_since_ns = h->dirty.quiet_since_ns;
+		out->last_sample_ns = h->dirty.last_sample_ns;
+		out->qualified_ns = h->dirty.qualified_ns;
+	}
+	out->now_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&m->lock, flags);
+unlock:
+	mmap_write_unlock(mm);
+put:
+	mmput(mm);
+	return ret;
+}
+
 #ifdef CONFIG_CMDP_TEST
+static long cmdp_monitor_test_invalidate(struct cmdp_monitor *m, void __user *up)
+{
+	struct cmdp_monitor_test_invalidate req;
+	struct mmu_notifier_range range;
+	struct mm_struct *mm = NULL;
+	struct vm_area_struct *vma;
+	unsigned long addr;
+	int ret;
+
+	if (copy_from_user(&req, up, sizeof(req)))
+		return -EFAULT;
+	if (req.size != sizeof(req) || req.version != CMDP_MONITOR_VERSION ||
+	    req.reserved[0] || req.reserved[1] || cmdp_validate_addr(req.start) ||
+	    req.end <= req.start || req.end > TASK_SIZE_MAX ||
+	    (req.end & ~PAGE_MASK) || req.end - req.start > 1024UL * PAGE_SIZE)
+		return -EINVAL;
+	mutex_lock(&m->ctl);
+	if (m->session && READ_ONCE(m->status.state) < CMDP_MON_STOPPING &&
+	    mmget_not_zero(m->session->mm))
+		mm = m->session->mm;
+	mutex_unlock(&m->ctl);
+	if (!mm)
+		return -ESRCH;
+	ret = mmap_write_lock_killable(mm);
+	if (ret)
+		goto put;
+	if (READ_ONCE(m->status.state) >= CMDP_MON_STOPPING) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
+	for (addr = req.start; addr < req.end; addr = min(req.end, vma->vm_end)) {
+		vma = vma_lookup(mm, addr);
+		if (!vma) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		vma_start_write(vma);
+	}
+	/* Deliberately external: not the session owner and not PROTECTION_PAGE.
+	 * Like a skipped NUMA PTE, start/end occur without changing the PTE.
+	 */
+	mmu_notifier_range_init_owner(&range, MMU_NOTIFY_PROTECTION_VMA, 0,
+			mm, req.start, req.end, &cmdp_test_owner);
+	mmu_notifier_invalidate_range_start(&range);
+	mmu_notifier_invalidate_range_end(&range);
+unlock:
+	mmap_write_unlock(mm);
+put:
+	mmput(mm);
+	return ret;
+}
+
 static long cmdp_monitor_test_hold_mmap(struct cmdp_monitor *m, void __user *up)
 {
 	struct cmdp_monitor_test_hold hold;
@@ -2171,6 +2491,8 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		struct cmdp_monitor_dirty_config dirty_config;
 		struct cmdp_monitor_dirty_status dirty_status;
 		struct cmdp_monitor_dirty_page dirty_page;
+		struct cmdp_monitor_diagnostics diagnostics;
+		struct cmdp_monitor_page_snapshot snapshot;
 	} data;
 	struct cmdp_history *h;
 	struct cmdp_cohort *c;
@@ -2182,6 +2504,8 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 #ifdef CONFIG_CMDP_TEST
 	if (cmd == CMDP_MON_TEST_HOLD_MMAP)
 		return cmdp_monitor_test_hold_mmap(m, up);
+	if (cmd == CMDP_MON_TEST_INVALIDATE)
+		return cmdp_monitor_test_invalidate(m, up);
 #endif
 	if (cmd == CMDP_MON_STOP) {
 		mutex_lock(&m->ctl);
@@ -2358,6 +2682,41 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			spin_unlock_irqrestore(&s->address_lock, flags);
 		}
 		if (copy_to_user(up, &data.progress, sizeof(data.progress)))
+			ret = -EFAULT;
+		break;
+	case CMDP_MON_DIAGNOSTICS:
+		if (copy_from_user(&data.diagnostics, up, sizeof(data.diagnostics))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (data.diagnostics.size != sizeof(data.diagnostics) ||
+		    data.diagnostics.version != CMDP_MONITOR_VERSION) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		data.diagnostics = m->diagnostics;
+		data.diagnostics.size = sizeof(data.diagnostics);
+		data.diagnostics.version = CMDP_MONITOR_VERSION;
+		data.diagnostics.now_ns = ktime_get_ns();
+		data.diagnostics.unknown = m->dirty.unknown;
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (copy_to_user(up, &data.diagnostics, sizeof(data.diagnostics)))
+			ret = -EFAULT;
+		break;
+	case CMDP_MON_PAGE_SNAPSHOT:
+		if (copy_from_user(&data.snapshot, up, sizeof(data.snapshot))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (data.snapshot.size != sizeof(data.snapshot) ||
+		    data.snapshot.version != CMDP_MONITOR_VERSION ||
+		    cmdp_validate_addr(data.snapshot.addr)) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = cmdp_monitor_page_snapshot(m, &data.snapshot);
+		if (!ret && copy_to_user(up, &data.snapshot, sizeof(data.snapshot)))
 			ret = -EFAULT;
 		break;
 	case CMDP_MON_PAGE:

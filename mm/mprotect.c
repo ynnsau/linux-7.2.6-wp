@@ -575,9 +575,10 @@ again:
 			continue;
 
 		if (!range.start) {
-			mmu_notifier_range_init(&range,
+			mmu_notifier_range_init_owner(&range,
 						MMU_NOTIFY_PROTECTION_VMA, 0,
-						vma->vm_mm, addr, end);
+						vma->vm_mm, addr, end,
+						cmdp_protection_owner(cp_flags & MM_CP_PROT_NUMA));
 			mmu_notifier_invalidate_range_start(&range);
 		}
 
@@ -868,7 +869,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 	if (mmap_write_lock_killable(current->mm))
 		return -EINTR;
 
-	error = cmdp_mm_modify(current->mm, start, end);
+	error = cmdp_mm_modify(current->mm, start, end, CMDP_MON_SOURCE_MPROTECT);
 	if (error)
 		goto out;
 

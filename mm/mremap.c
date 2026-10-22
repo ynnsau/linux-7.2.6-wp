@@ -1994,11 +1994,13 @@ static unsigned long do_mremap(struct vma_remap_struct *vrm)
 		return -EINTR;
 	vrm->mmap_locked = true;
 
-	res = cmdp_mm_modify(mm, vrm->addr, vrm->addr + vrm->old_len);
+	res = cmdp_mm_modify(mm, vrm->addr, vrm->addr + vrm->old_len,
+			     CMDP_MON_SOURCE_MREMAP);
 	if (res)
 		goto out;
 	if (vrm_implies_new_addr(vrm)) {
-		res = cmdp_mm_modify(mm, vrm->new_addr, vrm->new_addr + vrm->new_len);
+		res = cmdp_mm_modify(mm, vrm->new_addr, vrm->new_addr + vrm->new_len,
+				     CMDP_MON_SOURCE_MREMAP);
 		if (res)
 			goto out;
 	}

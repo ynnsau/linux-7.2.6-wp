@@ -80,6 +80,48 @@ static void pass_json(const char *event, const struct cmdp_monitor_pass *p)
 	puts("}}");
 	funlockfile(stdout);
 }
+static int diagnostics_read(int fd)
+{
+	static const char *const rejects[] = {
+		"nonresident", "swapped", "protnone", "readonly", "saved_dirty",
+		"page_type", "aliases", "pins", "folio_busy", "mapping", "owned",
+		"resource", "sequence", "other"
+	};
+	static const char *const sources[] = {
+		"unknown", "numa", "protection", "mprotect", "mremap", "unmap",
+		"clear", "test"
+	};
+	struct cmdp_monitor_diagnostics d;
+
+	_Static_assert(sizeof(rejects) / sizeof(rejects[0]) == CMDP_MON_NR_UNKNOWNS,
+		       "unknown names must match UAPI");
+	_Static_assert(sizeof(sources) / sizeof(sources[0]) == CMDP_MON_NR_SOURCES,
+		       "source names must match UAPI");
+	INIT_REQ(d);
+	if (ioctl(fd, CMDP_MON_DIAGNOSTICS, &d)) {
+		if (errno == ENOTTY) return 0;
+		return -1;
+	}
+	flockfile(stdout);
+	printf("{\"event\":\"diagnostics\",\"now_ns\":%llu,\"unknown\":%llu,"
+	       "\"trace_records\":%llu,\"trace_records_dropped\":%llu,\"rejected\":{",
+	       d.now_ns, d.unknown, d.trace_records, d.trace_records_dropped);
+	for (unsigned int i = 0; i < CMDP_MON_NR_UNKNOWNS; i++)
+		printf("%s\"%s\":%llu", i ? "," : "", rejects[i], d.rejected[i]);
+	printf("},\"invalidation_sources\":{");
+	for (unsigned int i = 0; i < CMDP_MON_NR_SOURCES; i++) {
+		const struct cmdp_monitor_invalidation_stats *v = &d.source[i];
+		printf("%s\"%s\":{\"calls\":%llu,\"arm_revoked\":%llu,"
+		       "\"observations_reset\":%llu,\"histories_reset\":%llu,"
+		       "\"elapsed_ns\":%llu,\"max_ns\":%llu}", i ? "," : "",
+		       sources[i], v->calls, v->arm_revoked, v->observations_reset,
+		       v->histories_reset, v->elapsed_ns, v->max_ns);
+	}
+	puts("}}");
+	funlockfile(stdout);
+	return 0;
+}
+
 static int dirty_status_read(int fd)
 {
 	struct cmdp_monitor_dirty_status d;
@@ -128,7 +170,9 @@ static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 		printf("%s\"%s\":%llu", i ? "," : "", reason(i), s->terminals[i]);
 	puts("}}");
 	funlockfile(stdout);
-	return dirty_status_read(fd);
+	if (dirty_status_read(fd))
+		return -1;
+	return diagnostics_read(fd);
 }
 
 static const char *scan_phase(unsigned int n)

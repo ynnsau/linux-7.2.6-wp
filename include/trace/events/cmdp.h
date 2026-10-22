@@ -36,5 +36,40 @@ TRACE_EVENT(cmdp_event,
 		  __entry->error)
 );
 
+/* One bounded summary per external range, not one record per page. */
+TRACE_EVENT(cmdp_invalidation,
+	TP_PROTO(u64 session_id, unsigned int source, unsigned long start,
+		 unsigned long end, u64 revoked, u64 observations, u64 histories,
+		 u64 elapsed_ns, int error),
+	TP_ARGS(session_id, source, start, end, revoked, observations, histories,
+		elapsed_ns, error),
+	TP_STRUCT__entry(
+		__field(u64, session_id)
+		__field(unsigned int, source)
+		__field(unsigned long, start)
+		__field(unsigned long, end)
+		__field(u64, revoked)
+		__field(u64, observations)
+		__field(u64, histories)
+		__field(u64, elapsed_ns)
+		__field(int, error)
+	),
+	TP_fast_assign(
+		__entry->session_id = session_id;
+		__entry->source = source;
+		__entry->start = start;
+		__entry->end = end;
+		__entry->revoked = revoked;
+		__entry->observations = observations;
+		__entry->histories = histories;
+		__entry->elapsed_ns = elapsed_ns;
+		__entry->error = error;
+	),
+	TP_printk("session=%llu source=%u start=%lx end=%lx revoked=%llu observations=%llu histories=%llu ns=%llu error=%d",
+		__entry->session_id, __entry->source, __entry->start, __entry->end,
+		__entry->revoked, __entry->observations, __entry->histories,
+		__entry->elapsed_ns, __entry->error)
+);
+
 #endif
 #include <trace/define_trace.h>

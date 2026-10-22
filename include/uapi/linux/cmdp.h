@@ -189,4 +189,73 @@ struct cmdp_monitor_dirty_page {
 #define CMDP_MON_DIRTY_STATUS _IOWR(CMDP_IOC_MAGIC, 26, struct cmdp_monitor_dirty_status)
 #define CMDP_MON_DIRTY_PAGE _IOWR(CMDP_IOC_MAGIC, 27, struct cmdp_monitor_dirty_page)
 
+/* Additive diagnostics. All rejection reasons are exclusive: their sum equals
+ * unknown at this same snapshot (separate DIRTY_STATUS queries can race).
+ * Sources describe the notification/callsite, not the ultimate physical cause.
+ * MODIFY calls and their subsequent notifiers are separate events; arm_revoked
+ * counts only generations actually terminated by that callback.
+ */
+enum cmdp_monitor_unknown {
+	CMDP_MON_UNKNOWN_NONRESIDENT, CMDP_MON_UNKNOWN_SWAPPED,
+	CMDP_MON_UNKNOWN_PROTNONE, CMDP_MON_UNKNOWN_READONLY,
+	CMDP_MON_UNKNOWN_SAVED_DIRTY, CMDP_MON_UNKNOWN_PAGE_TYPE,
+	CMDP_MON_UNKNOWN_ALIASES, CMDP_MON_UNKNOWN_PINS,
+	CMDP_MON_UNKNOWN_FOLIO_BUSY, CMDP_MON_UNKNOWN_MAPPING,
+	CMDP_MON_UNKNOWN_OWNED, CMDP_MON_UNKNOWN_RESOURCE,
+	CMDP_MON_UNKNOWN_SEQUENCE, CMDP_MON_UNKNOWN_OTHER,
+	CMDP_MON_NR_UNKNOWNS,
+};
+enum cmdp_monitor_invalidation_source {
+	CMDP_MON_SOURCE_UNKNOWN, CMDP_MON_SOURCE_NUMA,
+	CMDP_MON_SOURCE_PROTECTION, CMDP_MON_SOURCE_MPROTECT,
+	CMDP_MON_SOURCE_MREMAP, CMDP_MON_SOURCE_UNMAP,
+	CMDP_MON_SOURCE_CLEAR, CMDP_MON_SOURCE_TEST,
+	CMDP_MON_NR_SOURCES,
+};
+struct cmdp_monitor_invalidation_stats {
+	__u64 calls, arm_revoked, observations_reset, histories_reset;
+	__u64 elapsed_ns, max_ns;
+};
+struct cmdp_monitor_diagnostics {
+	__u32 size, version;
+	__u64 now_ns, unknown;
+	__u64 rejected[CMDP_MON_NR_UNKNOWNS];
+	struct cmdp_monitor_invalidation_stats source[CMDP_MON_NR_SOURCES];
+	/* At most 4096 summary trace records per attachment; aggregate counts
+	 * continue after that cap. Disabled tracing consumes no record budget.
+	 * trace_records_dropped is CMD-P cap suppression, not tracefs loss.
+	 */
+	__u64 trace_records, trace_records_dropped;
+};
+enum cmdp_monitor_pte_category {
+	CMDP_MON_PTE_UNMAPPED, CMDP_MON_PTE_NONRESIDENT,
+	CMDP_MON_PTE_PROTNONE, CMDP_MON_PTE_WRITABLE,
+	CMDP_MON_PTE_READONLY, CMDP_MON_PTE_SAVED_DIRTY,
+	CMDP_MON_PTE_UNSUPPORTED, CMDP_MON_PTE_SHADOW_STACK,
+};
+/* One-address diagnostic, not a process-wide atomic snapshot. mmap/VMA/PTL
+ * exclusion stabilizes mapping and ownership during collection. Reading this
+ * does not fault or touch target memory, change A/D bits or widen permissions.
+ * Returns EAGAIN when mmap exclusion is busy; callers must bound retries.
+ * pte_flags is x86 PTE flags (no PFN); pfn is 0 when no normal page exists.
+ */
+struct cmdp_monitor_page_snapshot {
+	__u32 size, version;
+	__u64 addr;
+	__u64 now_ns, pfn, pte_flags, arm_generation, epoch_id;
+	__u64 quiet_since_ns, last_sample_ns, qualified_ns;
+	__u32 category, owned, history_state, observation_valid;
+};
+/* CONFIG_CMDP_TEST only. A bounded (1..1024 base pages) external protection
+ * notification under mmap/VMA write exclusion; deliberately changes no PTE.
+ */
+struct cmdp_monitor_test_invalidate {
+	__u32 size, version;
+	__u64 start, end;
+	__u64 reserved[2];
+};
+#define CMDP_MON_DIAGNOSTICS _IOWR(CMDP_IOC_MAGIC, 28, struct cmdp_monitor_diagnostics)
+#define CMDP_MON_PAGE_SNAPSHOT _IOWR(CMDP_IOC_MAGIC, 29, struct cmdp_monitor_page_snapshot)
+#define CMDP_MON_TEST_INVALIDATE _IOW(CMDP_IOC_MAGIC, 30, struct cmdp_monitor_test_invalidate)
+
 #endif /* _UAPI_LINUX_CMDP_H */
