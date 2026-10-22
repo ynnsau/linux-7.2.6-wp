@@ -1,8 +1,8 @@
 # CMD-P ARM recovery: 2026-10-21 build and experiment handoff
 
 **Build status:** the diagnostic-only defect reproduction and all six suites
-on both debug and production images have passed. The full production module
-build is running. Installation verification and native recovery measurements
+on both debug and production images have passed. The full production build completed successfully with 5,072 modules.
+Installation verification and native recovery measurements
 remain **pending**. The production image is `7.2.6-cmdp-rearm-production`; it is not yet installed or booted. GRUB selection and reboot remain with the user.
 
 ## Problem and resulting behavior
@@ -85,11 +85,14 @@ later tools-only commit with a new kernel implementation.
 | Debug `.config` | `69b462ec7f94b7161f10ed5c055f473b091ee8ffaae5bf48f05d04f4c007b1cd` |
 | Production image | `9de55b107d65a2c5a5457e86f0008faf7f8f8c1ce584485f7a3aea6c2160b323` |
 | Production GNU build ID | `af98a59cd997005cf396c829f814f03a1986c6b4` |
-| Production module count | **Pending full build verification** |
+| Production module count | 5072 |
 
 The debug release is `7.2.6-cmdp-rearm-debug`, with `PROVE_LOCKING`,
 `DEBUG_ATOMIC_SLEEP`, and `DEBUG_VM` enabled. No production image digest or module
-count is inferred from the debug build.
+count is inferred from the debug build. The full build exited zero and its final
+image hash is identical to the production VM input. Nine frame-size warnings in
+unchanged Mellanox/RDMA drivers exactly match the previous dirty-kernel build;
+there are no CMD-P warnings or compiler/make errors.
 
 An initial baseline initramfs preparation attempt failed while collecting
 shared libraries for both GAPBS binaries. Commit `cb2865303` corrected collection
