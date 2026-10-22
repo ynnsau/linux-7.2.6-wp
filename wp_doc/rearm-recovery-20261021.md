@@ -5,8 +5,8 @@ measurement tools are committed and pushed. The baseline reproducer, all six
 debug suites and all six production suites passed. The full kernel and 5,072
 modules were built and installed as **`7.2.6-cmdp-rearm-production`**. Installation
 verification passed all 366 checks. GRUB is unchanged and no reboot was performed;
-BMP still runs `7.2.6-cmdp-dirty-production`. Native recovery measurements remain
-pending the user's GRUB selection and reboot.
+BMP still runs `7.2.6-cmdp-dirty-production`. The user subsequently booted this kernel and the
+[native recovery matrix passed](native-recovery-results-20261022.md).
 
 ## Problem and resulting behavior
 
@@ -235,3 +235,10 @@ include contention. It is not the complete architectural fault cost or
 end-to-end application overhead; overlapping helper times must not be added as
 though they were disjoint application time. Native coverage and performance
 findings remain pending until the candidate is booted and measured.
+
+## Completed native follow-up
+
+The user booted the installed candidate. Fresh provenance, all 11 native phases
+and the four-cell analysis passed; see [the native results](native-recovery-results-20261022.md).
+The earlier installation statements above describe that preboot handoff; the
+new report records the actual boot and measured BFS/PR outcomes.
