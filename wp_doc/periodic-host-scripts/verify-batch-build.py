@@ -34,6 +34,13 @@ modules=[x[:-2]+'.ko' if x.endswith('.o') else x for x in ordered]
 missing=[x for x in modules if not (out/x).is_file()]
 require(len(modules)>5000,'Production module set unexpectedly small')
 require(not missing,'Some modules.order artifacts missing')
+# The build is incremental from a preserved previous output tree. Verify every
+# module's release, not only the count or a few installed driver samples.
+vermagic_prefix = ('vermagic=' + release + ' ').encode()
+bad_vermagic = [name for name in modules if (out / name).is_file() and
+                vermagic_prefix not in (out / name).read_bytes()]
+require(not bad_vermagic, 'Stale or mismatched module release')
+
 image_hash=artifacts.get('arch/x86/boot/bzImage',{}).get('sha256')
 SUITES = ('batch', 'dirty', 'small', 'scale', 'numa', 'recovery', 'recovery-numa')
 KERNEL_INPUTS = ('mm/cmdp.c', 'mm/mprotect.c', 'mm/mremap.c',
@@ -192,7 +199,7 @@ for log in sorted((run/'logs').glob('production-build-*.log')):
 commit=subprocess.check_output(['git','-C',str(src),'rev-parse','HEAD'],universal_newlines=True).strip()
 status=subprocess.check_output(['git','-C',str(src),'status','--porcelain'],universal_newlines=True)
 require(not status,'Source tree is not clean')
-r={'pass':not errors,'errors':errors,'release':release,'commit':commit,'source_path':str(src),'build_path':str(out),'artifacts':artifacts,'module_count':len(modules),'missing_modules':missing,'build_job':a.build_job,'build_log':str(selected_log),'build_exit_status':exit_status,'compiler_diagnostics':warnings,'historical_build_diagnostics':historical,'source_sha256':source_hashes,'source_freezes':source_freezes,'production_vm_suites':vm_runs,'debug_vm_suites':debug_runs,'debug_artifacts':{'arch/x86/boot/bzImage':{'sha256':debug_hash},'.config':{'sha256':sha(debug_out/'.config')}}}
+r={'pass':not errors,'errors':errors,'release':release,'commit':commit,'source_path':str(src),'build_path':str(out),'artifacts':artifacts,'module_count':len(modules),'missing_modules':missing,'bad_module_vermagic':bad_vermagic,'module_vermagic_checked':len(modules),'build_job':a.build_job,'build_log':str(selected_log),'build_exit_status':exit_status,'compiler_diagnostics':warnings,'historical_build_diagnostics':historical,'source_sha256':source_hashes,'source_freezes':source_freezes,'production_vm_suites':vm_runs,'debug_vm_suites':debug_runs,'debug_artifacts':{'arch/x86/boot/bzImage':{'sha256':debug_hash},'.config':{'sha256':sha(debug_out/'.config')}}}
 (run/'records'/'build-verification.json').write_text(json.dumps(r,indent=2)+'\n')
 print(json.dumps({'pass':r['pass'],'release':release,'commit':commit,'modules':len(modules),'build_job':a.build_job,'diagnostics':len(warnings),'historical_jobs':len(historical),'errors':errors}))
 sys.exit(0 if r['pass'] else 1)

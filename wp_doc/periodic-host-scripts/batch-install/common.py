@@ -80,6 +80,9 @@ def verified_record(expected_sha):
     names = module_paths()
     check('module_count', len(names) == record.get('module_count') and len(names) > 5000)
     check('module_outputs_present', all((BUILD / name).is_file() for name in names))
+    check('all_module_releases_recorded', record.get('module_vermagic_checked') == len(names) and
+          record.get('bad_module_vermagic') == [])
+
     job = record.get('build_job', '')
     check('build_job', bool(re.fullmatch('production-build-[A-Za-z0-9][A-Za-z0-9_-]*', job)))
     if checks['build_job']:
