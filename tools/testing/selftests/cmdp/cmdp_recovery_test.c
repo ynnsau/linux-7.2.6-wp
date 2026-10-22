@@ -384,6 +384,37 @@ int main(int argc, char **argv)
 		CHECK(stop() && command('R', 0), "NUMA integration preserves data and drains ownership");
 		goto finish;
 	}
+	if (!expect_stranded) {
+		/* Exercise the exact kernel predicate using local scalar PTEs only;
+		 * never install malformed/CET-like encodings into application PTEs. */
+		const uint64_t present = CMDP_MON_TEST_PTE_PRESENT, rw = CMDP_MON_TEST_PTE_RW;
+		const uint64_t d = CMDP_MON_TEST_PTE_DIRTY, sd = CMDP_MON_TEST_PTE_SAVED_DIRTY;
+		struct encoding { uint64_t flags, cleared; unsigned int supported, dirty; } cases[] = {
+			{ present | rw, present | rw, 1, 0 },
+			{ present | rw | d, present | rw, 1, 1 },
+			{ present, present, 1, 0 },
+			{ present | sd, present, 1, 1 },
+			{ present | d, present | d, 0, 1 },
+			{ present | d | sd, present | d | sd, 0, 1 },
+			{ present | rw | sd, present | rw | sd, 0, 1 },
+			{ present | rw | d | sd, present | rw | d | sd, 0, 1 },
+			{ 0, 0, 0, 0 },
+			{ CMDP_MON_TEST_PTE_PROTNONE, CMDP_MON_TEST_PTE_PROTNONE, 0, 0 },
+		};
+		for (unsigned int i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+			struct cmdp_monitor_test_pte test;
+			INIT(test); test.flags = cases[i].flags;
+			CHECK(!ioctl(fd, CMDP_MON_TEST_PTE, &test) && test.supported == cases[i].supported &&
+			      test.dirty == cases[i].dirty && test.cleared_flags == cases[i].cleared,
+			      "real sampler predicate and selected-bit clearing match safe encoding matrix");
+			printf("CMDP_RECOVERY_ENCODING case=%u flags=%" PRIx64 " supported=%u dirty=%u cleared=%" PRIx64 "\n",
+			       i, (uint64_t)test.flags, test.supported, test.dirty, (uint64_t)test.cleared_flags);
+		}
+		struct cmdp_monitor_test_pte invalid;
+		INIT(invalid); invalid.flags = present | CMDP_MON_TEST_PTE_PROTNONE;
+		CHECK(ioctl(fd, CMDP_MON_TEST_PTE, &invalid) < 0 && errno == EINVAL,
+		      "reject ambiguous abstract PRESENT plus PROTNONE combination");
+	}
 	uint64_t invalidated_ns = now_ns();
 	CHECK(invalidate(0, pages) && owned(0, pages, false) && snapshot(0, &after) &&
 	      after.pfn == before.pfn && after.pte_flags == before.pte_flags &&

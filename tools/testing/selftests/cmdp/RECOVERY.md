@@ -57,6 +57,11 @@ ordinary unconditional ARM policy on a dirty target page. After no-op invalidati
 and closing that monitor, a fresh qualified monitor must observe the saved dirty
 bit as dirty, clear it without adding write permission, and wait a fresh Q.
 
+The fixed fixture also tests the actual kernel PTE predicate using local scalar
+values: clean/dirty RW, clean/saved-dirty RO, unsupported RO hardware-dirty,
+RW saved-dirty, nonpresent and PROT_NONE encodings. Unsupported encodings must
+remain unchanged. These values are never installed into process page tables.
+
 The test-only no-op notification is limited to 1–1024 pages, uses the external
 protection notifier path, and changes no PTE. It is a deterministic approximation
 of the no-change outcome of a protection walk, not a claim to reproduce every
