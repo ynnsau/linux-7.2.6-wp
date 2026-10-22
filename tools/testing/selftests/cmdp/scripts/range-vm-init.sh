@@ -46,6 +46,9 @@ test -w /proc/sys/kernel/numa_balancing || rc=1
 test "$rc" = 0 || finish
 echo 0 > /proc/sys/kernel/numa_balancing
 case "$suite" in
+batch)
+    run /tests/cmdp_batch_test
+    ;;
 recovery-baseline|recovery|recovery-numa)
     run /tests/recovery-vm-tests.sh
     ;;

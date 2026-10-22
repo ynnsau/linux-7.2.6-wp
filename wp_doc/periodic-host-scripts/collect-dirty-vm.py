@@ -87,7 +87,18 @@ for name, block in blocks.items():
     require(result['pass'],'Workload failed: '+name)
 suite_match=re.search(r'cmdp_suite=([^ "\\]+)',(run/'qemu-command.txt').read_text())
 suite=suite_match.group(1) if suite_match else 'unknown'
-if suite=='dirty':
+if suite=='batch':
+    require(not blocks and len(taps)==1 and taps[0]['planned']>=250, 'Missing batch fixture TAP checks')
+    cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_BATCH_CASE ')]
+    expected={(str(n),str(t)) for n in (1,63,64,65,129,513) for t in (1,4)}
+    require({(x.get('pages'),x.get('threads')) for x in cases if x.get('kind')=='boundary'}==expected,
+            'Missing one/four-thread batch boundaries')
+    for kind in ('reset-window','partial-abort','arm-writers','stop-pending','capacity'):
+        require(sum(x.get('kind')==kind for x in cases)==1,'Missing batch case '+kind)
+    metrics=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_BATCH_METRIC ')]
+    require(len(metrics)==24 and all(0<int(x['batches'])<=int(x['pages'])<=64*int(x['batches']) for x in metrics),
+            'Invalid/missing actual batch flush measurements')
+elif suite=='dirty':
     require(set(blocks)=={'observe-bfs1','observe-bfs4','qualify-bfs1','qualify-bfs4'},'Missing dirty BFS mode/thread blocks')
     require(len(taps)==5 and taps[0]['planned']==18 and taps[1]['planned']==59 and taps[-1]['planned']>=80,'Unexpected dirty regression TAP suites')
     require(sum(x.strip()=='CMDP_DIRTY_SWAP_READY' for x in lines)==1,'Swap was not enabled')
@@ -127,7 +138,7 @@ elif suite in ('recovery-baseline','recovery','recovery-numa'):
                 'Actual NUMA invalidation did not revoke ARM in every case')
 stats={}
 for line in lines:
-    m=re.fullmatch(r'(arms|publishes|revokes|waiters|rejects|entries|managed|isolated|stale|arm_ns|revoke_ns)\s+([0-9]+)',line.strip())
+    m=re.fullmatch(r'(arms|publishes|revokes|waiters|rejects|entries|managed|isolated|stale|arm_ns|revoke_ns|dirty_flush_batches|dirty_flush_pages|arm_flush_batches|arm_flush_pages|scan_active_skips|scan_page_lookups|test_batch_waits|test_batch_waiting)\s+([0-9]+)',line.strip())
     if m: stats[m.group(1)]=int(m.group(2))
 for key in ('entries','managed','isolated'): require(stats.get(key)==0,'Final '+key+' is not zero')
 summary={'pass':not errors,'suite':suite,'errors':errors,'tap_suites':taps,'workloads':workloads,'global_stats':stats,'warning_signatures':warnings,'serial_sha256':hashlib.sha256(raw).hexdigest()}
