@@ -10,7 +10,7 @@ STATUS_EVENTS = {'status', 'stopping_status', 'observation_end', 'final'}
 COHORT_EVENTS = {'sweep', 'cohort_snapshot', 'cohort_observation_end', 'cohort_final'}
 
 
-def validate(path, minimum=1, compute_seconds=0):
+def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
     errors = []
     records = []
     try:
@@ -128,7 +128,7 @@ def validate(path, minimum=1, compute_seconds=0):
             errors.append('Sampling-only policy unexpectedly armed or write-revoked pages')
         if dirty_mode == 2 and final:
             admissions = final.get('first_arms', 0) + final.get('rearms', 0)
-            if not admissions:
+            if require_admissions and not admissions:
                 errors.append('Qualification run admitted no pages; admission test is vacuous')
             if admissions > dirty_final.get('qualified', 0):
                 errors.append('Admissions exceed qualified observation epochs')
@@ -168,6 +168,7 @@ def validate(path, minimum=1, compute_seconds=0):
         errors.append(f'BFS measured compute duration {sum(trials):.3f}s is below {compute_seconds}s')
     return {
         'pass': not errors, 'errors': errors, 'completed_sweeps': completed,
+        'requirements': {'minimum_completed_sweeps': minimum, 'require_admissions': require_admissions},
         'completed_sweeps_source': ('final_status' if final else
                                    'last_status' if observed.get('passes_completed') is not None else
                                    'observed_complete_cohorts' if completed is not None else 'unknown'),
@@ -189,8 +190,11 @@ if __name__ == '__main__':
     parser.add_argument('run', type=pathlib.Path)
     parser.add_argument('--min-sweeps', type=int, default=1)
     parser.add_argument('--min-compute-seconds', type=float, default=0)
+    parser.add_argument('--allow-zero-admissions', action='store_true',
+                        help='For correctness/timing pilots only; still check all safety and accounting invariants')
     args = parser.parse_args()
-    result = validate(args.run, args.min_sweeps, args.min_compute_seconds)
+    result = validate(args.run, args.min_sweeps, args.min_compute_seconds,
+                      require_admissions=not args.allow_zero_admissions)
     (args.run / 'validation.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({key: result[key] for key in ('pass', 'errors', 'completed_sweeps', 'final_state_known')}, indent=2))
     sys.exit(0 if result['pass'] else 1)

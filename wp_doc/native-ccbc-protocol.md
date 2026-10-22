@@ -31,3 +31,10 @@ kernel code, GRUB, host configuration or application source. Commit test tooling
 before preparation, freeze HEAD throughout the matrix, and publish results only
 after evidence validation. No matched unmonitored baseline is part of this
 request; elapsed time and write-helper time must not be called total overhead.
+
+Application correctness and timing pilots may legitimately finish without an ARM
+admission. Their validation explicitly permits zero admissions while retaining
+all sampling, accounting, cleanup and host-health checks. Generated exercises
+and sustained observations retain the default nonzero-admission requirement.
+The original four-thread CC verification passed GAPBS but exposed this overly
+broad harness gate; that attempt remains preserved separately.

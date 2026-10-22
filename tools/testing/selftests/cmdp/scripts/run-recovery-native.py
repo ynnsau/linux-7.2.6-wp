@@ -141,7 +141,10 @@ class Recovery(previous.Harness):
                'OMP_PROC_BIND': 'close', 'OMP_PLACES': 'cores'}
         pth, cmd = self.execute(name, argv, 300 if generated else 1200, env, monitored=True)
         validator = load('recovery_validator', self.scripts / 'validate-run.py')
-        v = validator.validate(pth)
+        # Short application checks and sizing pilots need not reach admission.
+        # Generated kernel exercises and sustained observations still must ARM.
+        require_admissions = generated or self.a.operation == 'twitter-observe'
+        v = validator.validate(pth, require_admissions=require_admissions)
         save(pth / 'validation.json', v)
         assert v['pass'] and v['diagnostics'], v['errors']
         assert v['dirty']['mode'] == 2 and v['dirty']['quiet_ms'] == quiet
