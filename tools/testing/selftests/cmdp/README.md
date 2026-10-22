@@ -61,3 +61,5 @@ still queued in a per-CPU batch. Re-arm now drains that batch when necessary
 before isolation. A separate QEMU kernel with `CONFIG_PROVE_LOCKING` and
 `CONFIG_DEBUG_ATOMIC_SLEEP` passed the same 18 tests without lockdep or atomic
 sleep reports. Real hardware coherence/drain semantics remain unimplemented.
+
+See [BATCHING.md](BATCHING.md) for bounded dirty-reset/ARM flush batching and its VM tests.

@@ -85,3 +85,15 @@ unsupported writers/mappings, or implement adaptive retry thresholds. The
 20-scan concurrent stress test increases race exposure but is not proof that
 every possible interleaving occurred. The initial kernel policy remains a fixed
 quiet threshold; adaptive admission is a later experiment.
+
+## Batched implementation
+
+The monitor now resets and flushes bounded chunks of at most 64 addresses in
+one VMA. `dirty_status.flushes` counts reset pages covered by completed flushes
+and remains equal to `resets`; it is not an actual flush-call count in the
+batched implementation. Global debugfs `dirty_flush_batches` and
+`arm_flush_batches` count calls; their corresponding `*_pages` count covered
+reset/protected pages. Take differences around an isolated monitor run.
+Shared flush time is included once in `flush_ns` and `sample_ns`.
+See [BATCHING.md](BATCHING.md) for ordering, cancellation, extra counters and
+VM fixtures. The quiet threshold and policy are unchanged.
