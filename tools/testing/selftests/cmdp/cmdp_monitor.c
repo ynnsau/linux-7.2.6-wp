@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -25,6 +26,13 @@
 #define SYS_pidfd_open 434
 #else
 #error "pidfd_open syscall number is unavailable for this architecture"
+#endif
+#endif
+#ifndef SYS_pidfd_send_signal
+#if defined(__x86_64__)
+#define SYS_pidfd_send_signal 424
+#else
+#error "pidfd_send_signal syscall number is unavailable for this architecture"
 #endif
 #endif
 
@@ -291,6 +299,41 @@ child_error:
 	/* CLOEXEC EOF acknowledges successful exec, not application readiness. */
 	return pid;
 }
+
+struct target_measurement {
+	pid_t pid;
+	int status, error;
+	uint64_t exit_observed_ns;
+	struct rusage usage;
+};
+
+/* Observe exit independently of status reporting and the STOP/drain path.
+ * Only this thread reaps the child; main reads its fields after joining.
+ */
+static void *measure_target(void *arg)
+{
+	struct target_measurement *m = arg;
+	pid_t ret;
+
+	do { ret = wait4(m->pid, &m->status, 0, &m->usage); }
+	while (ret < 0 && errno == EINTR);
+	m->exit_observed_ns = now_ns();
+	if (ret < 0)
+		m->error = errno;
+	return NULL;
+}
+
+static void signal_owned_target(pid_t pid, int pidfd)
+{
+	/* A measurement thread may already have reaped the child: never signal
+	 * a reused numeric PID. Before pidfd_open no measurement thread exists.
+	 */
+	if (pidfd >= 0)
+		syscall(SYS_pidfd_send_signal, pidfd, SIGTERM, NULL, 0);
+	else
+		kill(pid, SIGTERM);
+}
+
 static void usage(const char *name)
 {
 	fprintf(stderr, "Usage: %s [options] -- COMMAND [ARG...]\n"
@@ -300,6 +343,7 @@ static void usage(const char *name)
 		"  --duration-sec N  stop monitoring after N seconds\n"
 		"  --once            one synchronous sweep, then stop\n"
 		"  --inventory       scan-only session; do not ARM\n"
+		"  --monitor-off     launch/measure only; never open or attach CMD-P\n"
 		"  --dirty-observe   sample hardware dirty bits; never ARM\n"
 		"  --dirty-qualify   ARM only after a valid quiet interval\n"
 		"  --quiet-ms N      required quiet interval (default 10000, minimum 10)\n"
@@ -312,12 +356,14 @@ static void usage(const char *name)
 }
 int main(int argc, char **argv)
 {
+	uint64_t controller_start_ns = now_ns();
 	static const struct option opts[] = {
 		{ "pid", 1, 0, 'p' }, { "period-ms", 1, 0, 'i' },
 		{ "sweeps", 1, 0, 'n' }, { "duration-sec", 1, 0, 'd' },
 		{ "once", 0, 0, '1' }, { "inventory", 0, 0, 's' },
 		{ "max-pages", 1, 0, 'm' }, { "max-history", 1, 0, 'H' },
 		{ "dirty-observe", 0, 0, 'o' }, { "dirty-qualify", 0, 0, 'q' },
+		{ "monitor-off", 0, 0, 'b' },
 		{ "quiet-ms", 1, 0, 'Q' },
 		{ "poll-ms", 1, 0, 'P' }, { "help", 0, 0, 'h' }, { 0 }
 	};
@@ -331,6 +377,9 @@ int main(int argc, char **argv)
 	pid_t pid = 0;
 	int fd = -1, pidfd = -1, result = 1, opt, poll_ms = 1000;
 	bool own = false, once = false, attached = false, quiet_set = false;
+	bool monitor_off = false, measuring = false;
+	pthread_t measure_thread;
+	struct target_measurement measurement = { 0 };
 	struct cmdp_monitor_dirty_config dirty_config;
 	INIT_REQ(dirty_config);
 	while ((opt = getopt_long(argc, argv, "+", opts, NULL)) != -1) {
@@ -341,6 +390,7 @@ int main(int argc, char **argv)
 		case 'd': seconds = number(optarg, 86400 * 365); break;
 		case '1': once = true; break;
 		case 's': a.flags |= CMDP_MONITOR_F_SCAN_ONLY; break;
+		case 'b': monitor_off = true; break;
 		case 'o':
 		case 'q':
 			if (dirty_mode) { fprintf(stderr, "choose one dirty mode\n"); return 2; }
@@ -355,6 +405,7 @@ int main(int argc, char **argv)
 		}
 	}
 	if (!poll_ms || (pid && optind != argc) || (!pid && optind == argc) ||
+	    (monitor_off && (pid || dirty_mode || quiet_set || a.flags || once || limit || seconds)) ||
 	    (dirty_mode && (a.flags & CMDP_MONITOR_F_SCAN_ONLY)) ||
 	    (quiet_set && (!dirty_mode || dirty_config.quiet_ms < 10))) {
 		usage(argv[0]); return 2;
@@ -364,8 +415,10 @@ int main(int argc, char **argv)
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
-	fd = open(CMDP_MONITOR_DEVICE, O_RDWR | O_CLOEXEC);
-	if (fd < 0) { perror("open cmdp_monitor"); goto out; }
+	if (!monitor_off) {
+		fd = open(CMDP_MONITOR_DEVICE, O_RDWR | O_CLOEXEC);
+		if (fd < 0) { perror("open cmdp_monitor"); goto out; }
+	}
 	if (!pid) {
 		launch_ns = now_ns();
 		pid = launch(&argv[optind]);
@@ -375,15 +428,34 @@ int main(int argc, char **argv)
 	}
 	pidfd = syscall(SYS_pidfd_open, pid, 0);
 	if (pidfd < 0) { perror("pidfd_open"); goto out; }
-	a.pidfd = pidfd;
-	if (ioctl(fd, CMDP_MON_ATTACH, &a)) { perror("CMDP_MON_ATTACH"); goto out; }
-	attached = true;
-	if (dirty_mode) {
-		dirty_config.mode = dirty_mode;
-		if (ioctl(fd, CMDP_MON_DIRTY_CONFIG, &dirty_config)) { perror("CMDP_MON_DIRTY_CONFIG"); goto out; }
+	if (!monitor_off) {
+		a.pidfd = pidfd;
+		if (ioctl(fd, CMDP_MON_ATTACH, &a)) { perror("CMDP_MON_ATTACH"); goto out; }
+		attached = true;
+		if (dirty_mode) {
+			dirty_config.mode = dirty_mode;
+			if (ioctl(fd, CMDP_MON_DIRTY_CONFIG, &dirty_config)) { perror("CMDP_MON_DIRTY_CONFIG"); goto out; }
+		}
 	}
-	printf("{\"event\":\"controller\",\"pid\":%d,\"launched\":%s,\"thp_disabled_before_exec\":%s,\"version\":%u,\"launch_ns\":%" PRIu64 ",\"exec_ack_ns\":%" PRIu64 "}\n",
-	       pid, own ? "true" : "false", own ? "true" : "false", CMDP_MONITOR_VERSION, launch_ns, exec_ack_ns);
+	printf("{\"event\":\"controller\",\"pid\":%d,\"launched\":%s,\"thp_disabled_before_exec\":%s,\"version\":%u,\"launch_ns\":%" PRIu64 ",\"exec_ack_ns\":%" PRIu64 ",\"monitor_enabled\":%s,\"controller_start_ns\":%" PRIu64 "}\n",
+	       pid, own ? "true" : "false", own ? "true" : "false", CMDP_MONITOR_VERSION, launch_ns, exec_ack_ns,
+	       monitor_off ? "false" : "true", controller_start_ns);
+	if (own) {
+		measurement.pid = pid;
+		int err = pthread_create(&measure_thread, NULL, measure_target, &measurement);
+		if (err) { fprintf(stderr, "start target measurement: %s\n", strerror(err)); goto out; }
+		measuring = true;
+	}
+	if (monitor_off) {
+		result = 0;
+		while (!interrupted) {
+			struct pollfd p = { .fd = pidfd, .events = POLLIN };
+			int n = poll(&p, 1, poll_ms);
+			if (n > 0) break;
+			if (n < 0 && errno != EINTR) { perror("baseline poll"); result = 1; break; }
+		}
+		goto out;
+	}
 	uint64_t begin = now_ns();
 	if (ioctl(fd, once ? CMDP_MON_SCAN_ONCE : CMDP_MON_START)) {
 		perror("start monitor"); goto out;
@@ -458,21 +530,32 @@ out:
 		}
 	}
 	if (fd >= 0 && close(fd)) result = 1;
-	if (pidfd >= 0) close(pidfd);
 	if (own) {
-		int child_status = 0;
 		/* Lifecycle stops report incomplete monitoring, but must not kill the app. */
-		if (interrupted || (!attached && result)) kill(pid, SIGTERM);
-		while (waitpid(pid, &child_status, 0) < 0) {
-			if (errno != EINTR) { result = 1; break; }
-			if (interrupted) kill(pid, SIGTERM);
+		if (interrupted || (!attached && result)) signal_owned_target(pid, pidfd);
+		if (measuring) {
+			int err = pthread_join(measure_thread, NULL);
+			if (err) { fprintf(stderr, "join target measurement: %s\n", strerror(err)); result = 1; }
+		} else {
+			measurement.pid = pid;
+			measure_target(&measurement);
 		}
+		if (measurement.error) { fprintf(stderr, "wait4: %s\n", strerror(measurement.error)); result = 1; }
+		int child_status = measurement.status;
 		int child_exit = WIFEXITED(child_status) ? WEXITSTATUS(child_status) :
 			128 + (WIFSIGNALED(child_status) ? WTERMSIG(child_status) : 0);
-		printf("{\"event\":\"target_exit\",\"exit_code\":%d}\n", child_exit);
+		struct rusage *r = &measurement.usage;
+		printf("{\"event\":\"target_exit\",\"exit_code\":%d,\"exit_observed_ns\":%" PRIu64
+		       ",\"wait4_errno\":%d,\"user_us\":%lld,\"system_us\":%lld,\"maxrss_kib\":%ld,"
+		       "\"minor_faults\":%ld,\"major_faults\":%ld,\"voluntary_switches\":%ld,\"involuntary_switches\":%ld}\n",
+		       child_exit, measurement.exit_observed_ns, measurement.error,
+		       (long long)r->ru_utime.tv_sec * 1000000 + r->ru_utime.tv_usec,
+		       (long long)r->ru_stime.tv_sec * 1000000 + r->ru_stime.tv_usec,
+		       r->ru_maxrss, r->ru_minflt, r->ru_majflt, r->ru_nvcsw, r->ru_nivcsw);
 		if (child_exit) result = child_exit;
 	}
+	if (pidfd >= 0) close(pidfd);
 	if (interrupted) result = 128 + interrupted;
-	printf("{\"event\":\"controller_exit\",\"exit_code\":%d}\n", result);
+	printf("{\"event\":\"controller_exit\",\"exit_code\":%d,\"now_ns\":%" PRIu64 "}\n", result, now_ns());
 	return result;
 }
