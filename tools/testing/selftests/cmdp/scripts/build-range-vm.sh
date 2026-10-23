@@ -17,7 +17,7 @@ mkdir -p "$stage"/{bin,sbin,etc,proc,sys,dev,tmp,tests,run} "$out/headers/linux"
 cp "$src/include/uapi/linux/cmdp.h" "$out/headers/linux/"
 cp "$busybox" "$stage/bin/busybox"
 ln -s busybox "$stage/bin/sh"
-for name in cmdp_test cmdp_monitor_test cmdp_range_test cmdp_dirty_test cmdp_recovery_test cmdp_batch_test cmdp_monitor cmdp_fixture; do
+for name in cmdp_test cmdp_monitor_test cmdp_range_test cmdp_dirty_test cmdp_recovery_test cmdp_batch_test cmdp_fused_test cmdp_monitor cmdp_fixture; do
     "$cc" -static -O2 -Wall -Wextra -Werror -pthread -I"$out/headers" \
         "$src/tools/testing/selftests/cmdp/$name.c" -o "$stage/tests/$name"
 done

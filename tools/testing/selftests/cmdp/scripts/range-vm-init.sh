@@ -46,6 +46,9 @@ test -w /proc/sys/kernel/numa_balancing || rc=1
 test "$rc" = 0 || finish
 echo 0 > /proc/sys/kernel/numa_balancing
 case "$suite" in
+fused)
+    run /tests/cmdp_fused_test
+    ;;
 batch)
     run /tests/cmdp_batch_test
     ;;

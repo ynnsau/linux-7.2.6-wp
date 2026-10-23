@@ -27,7 +27,9 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 #define PAGE 4096UL
+#ifndef BASE
 #define BASE UINT64_C(0x100000)
+#endif
 #define Q_MS 100
 #define INIT(x) do { memset(&(x), 0, sizeof(x)); (x).size = sizeof(x); \
     (x).version = CMDP_MONITOR_VERSION; } while (0)
@@ -112,10 +114,20 @@ static void child(void)
     while (!atomic_load(&ctl->quit)) {
         unsigned int op = atomic_load(&ctl->command);
         if (op != atomic_load(&ctl->ack)) {
-            switch (op % 4) {
+            switch (op % 8) {
             case 1: for (unsigned int i = 0; i < pages; i++) store(i); break;
             case 2: if (!verify()) atomic_fetch_add(&ctl->errors, 1); break;
-            case 3: break;
+            case 3: for (unsigned int i = 0; i < pages; i += 2) store(i); break;
+            case 4:
+                if (mprotect(area + (pages / 2) * PAGE, PAGE, PROT_READ) ||
+                    mprotect(area + (pages / 2) * PAGE, PAGE, PROT_READ | PROT_WRITE)) _exit(16);
+                break;
+            case 5:
+                if (munmap(area + (pages / 2) * PAGE, PAGE) ||
+                    mmap(area + (pages / 2) * PAGE, PAGE, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED) _exit(17);
+                store(pages / 2); break;
+            case 6: store(pages / 2); break;
             default: _exit(14);
             }
             atomic_store(&ctl->ack, op);
@@ -137,7 +149,7 @@ static bool wait_value(atomic_uint *value, unsigned int target)
 }
 static bool command(unsigned int op)
 {
-    unsigned int next = (atomic_load(&ctl->command) / 4 + 1) * 4 + op;
+    unsigned int next = (atomic_load(&ctl->command) / 8 + 1) * 8 + op;
     atomic_store(&ctl->command, next);
     return wait_value(&ctl->ack, next) && !atomic_load(&ctl->errors);
 }
@@ -191,7 +203,7 @@ static void start(unsigned int n, unsigned int t, unsigned int mode, unsigned in
     pidfd = syscall(SYS_pidfd_open, target_pid, 0);
     fd = open(CMDP_MONITOR_DEVICE, O_RDWR | O_CLOEXEC);
     struct cmdp_monitor_attach a;
-    INIT(a); a.pidfd = pidfd; a.period_ms = 50; a.max_pages = cap; a.max_history = 32768;
+    INIT(a); a.pidfd = pidfd; a.period_ms = 50; a.max_pages = cap; a.max_history = n + 4096 > 32768 ? n + 4096 : 32768;
     CHECK(pidfd >= 0 && fd >= 0 && !ioctl(fd, CMDP_MON_ATTACH, &a), "attach external monitor");
     struct cmdp_monitor_dirty_config d;
     INIT(d); d.mode = mode; d.quiet_ms = Q_MS;

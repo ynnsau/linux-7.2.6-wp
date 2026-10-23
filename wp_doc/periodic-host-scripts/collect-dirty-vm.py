@@ -87,7 +87,21 @@ for name, block in blocks.items():
     require(result['pass'],'Workload failed: '+name)
 suite_match=re.search(r'cmdp_suite=([^ "\\]+)',(run/'qemu-command.txt').read_text())
 suite=suite_match.group(1) if suite_match else 'unknown'
-if suite=='batch':
+if suite=='fused':
+    require(not blocks and len(taps)==1 and taps[0]['planned']>=490, 'Missing shared-flush fixture TAP checks')
+    cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_CASE ')]
+    pairs=((1,1),(1,64),(64,1),(17,91),(64,64),(512,512),(4096,4096),
+           (16384,16384),(65536,65536),(65536,64),(64,65536))
+    expected={(str(d),str(w),str(t)) for d,w in pairs for t in (1,4)}
+    require(len(cases)==22 and {(x.get('dirty'),x.get('wp'),x.get('threads')) for x in cases}==expected,
+            'Missing asymmetric/large-limit one/four-thread matrix')
+    metrics=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_METRIC ')]
+    require(len(metrics)==22 and all(0<int(x['max_dirty'])<=int(x['dirty']) and
+            0<int(x['max_wp'])<=int(x['wp']) and int(x['span'])<=max(int(x['dirty']),int(x['wp'])) and
+            int(x['allocated'])>=int(x['payload'])>0 for x in metrics), 'Invalid fused flush measurements')
+    require(all(int(x['shared'])>0 for x in metrics if min(int(x['dirty']),int(x['wp']))>1),
+            'Missing mixed dirty/ARM shared flush evidence')
+elif suite=='batch':
     require(not blocks and len(taps)==1 and taps[0]['planned']>=250, 'Missing batch fixture TAP checks')
     cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_BATCH_CASE ')]
     expected={(str(n),str(t)) for n in (1,63,64,65,129,513) for t in (1,4)}
