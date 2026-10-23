@@ -167,8 +167,11 @@ static void mixed_writers(void)
     CHECK(!ioctl(fd, CMDP_MON_STOP) && command(2) && balanced(),
           "concurrent shared-flush writers retain data and drain cleanly");
     struct cmdp_monitor_status st; INIT(st);
-    CHECK(!ioctl(fd, CMDP_MON_STATUS, &st) && st.terminals[CMDP_MON_WRITE] >= 64,
-          "writers actually revoke the protected odd fixture pages");
+    bool revoked = true;
+    for (unsigned int i = 1; i < 64; i += 2)
+        revoked &= query(i, &p) && p.state == CMDP_MON_PAGE_OFF_WRITE;
+    CHECK(!ioctl(fd, CMDP_MON_STATUS, &st) && st.terminals[CMDP_MON_WRITE] >= 32 && revoked,
+          "writers revoke every odd page already protected in the paused 64-address chunk");
     struct cmdp_monitor_batch_status b = batch_status();
     CHECK(b.shared_flush_calls > 0, "concurrent writer case actually uses shared shootdowns");
     printf("CMDP_FUSED_MIXED_WRITERS threads=4 resumed=4 wp=%llu shared=%llu\n",

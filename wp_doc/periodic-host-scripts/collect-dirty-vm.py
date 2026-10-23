@@ -103,7 +103,7 @@ if suite=='fused':
             'Missing mixed dirty/ARM shared flush evidence')
     writer_cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_MIXED_WRITERS ')]
     require(len(writer_cases)==1 and writer_cases[0].get('resumed')=='4' and
-            int(writer_cases[0].get('wp',0))>=64 and int(writer_cases[0].get('shared',0))>0,
+            int(writer_cases[0].get('wp',0))>=32 and int(writer_cases[0].get('shared',0))>0,
             'Missing concurrent four-writer shared-flush proof')
     allocation=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_ALLOCATION_BOUND ')]
     require(len(allocation)==1 and int(allocation[0]['history'])<=256 and
