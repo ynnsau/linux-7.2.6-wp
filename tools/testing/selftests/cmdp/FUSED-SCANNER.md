@@ -69,6 +69,8 @@ metadata, and must not be confused with target RSS or live history payload.
 shared, dirty-only and WP-only flush calls; flush time counted once; changed-page
 counts/maxima; address-span maximum; chunks ending at a cap/time limit; maximum
 hold; region/run skips; upper-walk/cache counts; live and allocated history bytes.
+`wp_pages` counts PTE protection changes, including changes later aborted;
+write-triggered WP events remain `status.terminals.write`.
 Legacy dirty/ARM role counters both include a shared flush, so do not add those
 role counters to infer actual flush-call count. Other reporting fields and
 page-lifetime/generation semantics remain available.
@@ -86,3 +88,10 @@ thread/mode: monitoring off, sampling only, and dirty→ARM; rotate mode order.
 Keep 10 s period and 10 s quiet interval. Record runtime, RSS, coverage, WP counts
 and actual shared-flush diagnostics. First compare 64/64; any additional cap
 configuration is another matched three-repetition set, not a replacement for it.
+
+The native helpers are `scripts/prepare-fused-overhead.py` (postboot audit and
+fresh tools, no tests) and `scripts/run-fused-overhead.py` (gates plus the 18-run
+campaign). They verify the installation/build receipts and inherit the exact
+outer runtime/RSS executor. The prepare base can also be the campaign base and
+`--prior`; use a new base for each cap pair. Do not use the old 144-run batching
+wrapper for this BFS-only three-repeat campaign.
