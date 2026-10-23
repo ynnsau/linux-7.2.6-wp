@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Reuse the same CPU-writer fixture and legacy regressions, at a 2 MiB base. */
-#define BASE UINT64_C(0x20000000)
+#define BASE UINT64_C(0x1000000000)
 #define main cmdp_batch_original_main
 #include "cmdp_batch_test.c"
 #undef main
