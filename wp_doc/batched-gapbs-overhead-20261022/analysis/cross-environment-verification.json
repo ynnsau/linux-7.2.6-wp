@@ -1,0 +1,19 @@
+{
+  "pass": true,
+  "verified_at": "2026-10-23T02:22:27.733031+00:00",
+  "measured_runs": 144,
+  "python_versions": {
+    "local": "3.9.6",
+    "remote": "3.6.9"
+  },
+  "primary_data_equal_except_python_version": true,
+  "comparison_statistics_equal": true,
+  "csv_and_input_manifest_sha256": {
+    "input-manifest.json": "46500e8990d6b3a12087cf2f24a98b1e9ef82ab74f515321fed0b39b0afbaafc",
+    "runs.csv": "83cc526129f06b571f08e8a43ec104e7ab16b6415c308823c32b2e0b704f0133",
+    "paired-overheads.csv": "d78c790c22737aaaa9d577754bd75480fbca279eb1ab0b72b7d439e3b81d8cf4",
+    "batch-counters.csv": "4f480b21596b6bb192d35217d2b8ff9fec904890b3baf576901b84446be4d71f"
+  },
+  "primary_source_sha256": "9095f9032553c7f7a6f61bdb3e5c9ecaa21a44ae1f379862739959fdcf69a6a3",
+  "comparison_source_sha256": "2f28176af1c00ea9a93b2b4c12e6c36635fba5b8d3f2c7746e0b886ba809a44e"
+}

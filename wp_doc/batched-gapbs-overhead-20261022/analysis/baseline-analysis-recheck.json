@@ -1,0 +1,7 @@
+{
+  "pass": true,
+  "measured_runs": 144,
+  "verified_input_files": 1445,
+  "analysis_source_sha256": "9095f9032553c7f7a6f61bdb3e5c9ecaa21a44ae1f379862739959fdcf69a6a3",
+  "statistics_match_archived_analysis": true
+}

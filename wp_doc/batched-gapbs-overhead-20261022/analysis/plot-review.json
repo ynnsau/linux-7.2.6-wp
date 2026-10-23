@@ -1,0 +1,145 @@
+{
+  "pass": true,
+  "reviewed_at": "2026-10-23T02:24:09.349461+00:00",
+  "png_figures_visually_reviewed": [
+    "batching-overhead-comparison",
+    "batching-off-baseline",
+    "batching-coverage-wp",
+    "batching-flush-coverage",
+    "matched-runtime",
+    "matched-overhead",
+    "matched-arm-rss",
+    "matched-peak-rss"
+  ],
+  "review": "All axes, legends, captions and data marks are legible without clipping. Shared scales and log WP scale are labeled. Six repeats and observed ranges are shown.",
+  "formats_checked": {
+    "batching-overhead-comparison.png": {
+      "bytes": 198377,
+      "sha256": "962ea8f22d9ee6d568202fd520f18a89621fc4bc2e20684818b57bb79f5ecb56",
+      "dimensions": [
+        2230,
+        1499
+      ]
+    },
+    "batching-overhead-comparison.svg": {
+      "bytes": 128071,
+      "sha256": "454d9874e8ce9a59ff43073323a4bc33c191f6b21cf7db607cf32df8b847e3b9"
+    },
+    "batching-overhead-comparison.pdf": {
+      "bytes": 38953,
+      "sha256": "5339d410d28df929cd4b570fb1e7d20c45e28b4a75c7c5deffeb4f6540bf8235"
+    },
+    "batching-off-baseline.png": {
+      "bytes": 111456,
+      "sha256": "e126fca0c4a29ab0fcd42fab5664f585b9d93ac666e283ebbe0f19ae31613503",
+      "dimensions": [
+        2230,
+        918
+      ]
+    },
+    "batching-off-baseline.svg": {
+      "bytes": 81277,
+      "sha256": "5814eebdd39fdbaf95c1ba74219052df9e53941a9bdccb41ea65333906f1ed23"
+    },
+    "batching-off-baseline.pdf": {
+      "bytes": 29965,
+      "sha256": "b89d86293423d28c4f251a74934b705b2f1ba7e76a56b72f4d41c1a76b00fbf5"
+    },
+    "batching-coverage-wp.png": {
+      "bytes": 198288,
+      "sha256": "3cc387f897182137b3010c9a14c926a3891274177f4a94f5c3c8a5dfd7043229",
+      "dimensions": [
+        2230,
+        1499
+      ]
+    },
+    "batching-coverage-wp.svg": {
+      "bytes": 130773,
+      "sha256": "01636e56fab1c445db01379be93a88c9a592a33156bb7ac21347a24c6f0fef08"
+    },
+    "batching-coverage-wp.pdf": {
+      "bytes": 39004,
+      "sha256": "bdbe4fff437f3d3be774da6d30b4919984e63d98bdf3865c33138e9856f4ad74"
+    },
+    "batching-flush-coverage.png": {
+      "bytes": 128107,
+      "sha256": "89bf9c6e393065c60ba7b8ff2e34c9ec4f612270c74464de4a1c107e0ddd33eb",
+      "dimensions": [
+        2320,
+        918
+      ]
+    },
+    "batching-flush-coverage.svg": {
+      "bytes": 103086,
+      "sha256": "ab63a20282e05c7d61560128d41dc30c0397ead1e82b5d3ed3e517a1714e25df"
+    },
+    "batching-flush-coverage.pdf": {
+      "bytes": 35292,
+      "sha256": "c33c244734fc86aa75107e70d91519bf41c84698975d1089701d0fb13fca98c5"
+    },
+    "matched-runtime.png": {
+      "bytes": 137006,
+      "sha256": "15fae927bf01f1c78550d8a92da019c5ca6666e084e197c9d4d2b95a18e42aeb",
+      "dimensions": [
+        2318,
+        990
+      ]
+    },
+    "matched-runtime.svg": {
+      "bytes": 92391,
+      "sha256": "51cbe445f7bfe53f79a7880238de70f6bb05c9279e5a3f803b349dc60503c07b"
+    },
+    "matched-runtime.pdf": {
+      "bytes": 35062,
+      "sha256": "18bf37c27e328be067dc35a56b7422961fa954b332415fa5bbf29554cc712bf9"
+    },
+    "matched-overhead.png": {
+      "bytes": 138467,
+      "sha256": "80c0d57d2cbee4c563a51e93a6869d063c2acd15bea38268a5e9fe67d36731f8",
+      "dimensions": [
+        2317,
+        985
+      ]
+    },
+    "matched-overhead.svg": {
+      "bytes": 81533,
+      "sha256": "a929ef142f9e629eeea99ff5c0c00f2fe2e1d18ae3cd5a93296a0c198f9eec7d"
+    },
+    "matched-overhead.pdf": {
+      "bytes": 31919,
+      "sha256": "cf9bd32491a6fda1fc8d97100daf89c01fab1dfe7739729bc2eca9a96962f94e"
+    },
+    "matched-arm-rss.png": {
+      "bytes": 279232,
+      "sha256": "8fbce09e4df65cbeefc0c8488770d12a93845b285cb61070f1e988b585e41fc8",
+      "dimensions": [
+        2318,
+        2151
+      ]
+    },
+    "matched-arm-rss.svg": {
+      "bytes": 272099,
+      "sha256": "b7e8efa415024036865b6b099e38f28f44b81b249c77097d22318690cd10453a"
+    },
+    "matched-arm-rss.pdf": {
+      "bytes": 49491,
+      "sha256": "10b1421a6eed68cc7745fefa8b94e0496004eaa04c7029278008d7536dbc8d27"
+    },
+    "matched-peak-rss.png": {
+      "bytes": 89812,
+      "sha256": "d8831025991f05dc9b0c28667dd1eaa5406012b8fb26d7d47a48516ceb76f246",
+      "dimensions": [
+        2317,
+        948
+      ]
+    },
+    "matched-peak-rss.svg": {
+      "bytes": 83639,
+      "sha256": "537e879a816934a8b7cc4b7626ef36165cdc353f55d157f6d61415d5367dec77"
+    },
+    "matched-peak-rss.pdf": {
+      "bytes": 31968,
+      "sha256": "6b8d3d3d99e093964bbc98932fdd4d00b160858c40919be63133d7189426e938"
+    }
+  }
+}

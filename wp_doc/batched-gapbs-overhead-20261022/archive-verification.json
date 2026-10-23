@@ -1,0 +1,13 @@
+{
+  "verified_at": "2026-10-23T02:20:05.179685+00:00",
+  "archive_sha256": "d668c9204ca843ade860653528306babd2d241c10a6ed875444cd3ad3193c94a",
+  "copy_manifest_sha256": "ba2eb82de6aa910ea5468443f18bb05649e4313523a6111599b4cc2f6eb160a2",
+  "raw_manifest_sha256": "6036ae44457f283fec9561d064c98b0ae667ff86703d75fc66ed17761b0a66bc",
+  "copied_files": 1971,
+  "copied_bytes": 130977136,
+  "raw_files": 1944,
+  "raw_bytes": 130216001,
+  "measured_runs": 144,
+  "source_commit": "ddb5aa85d51762d9c7c1a53c0b010bc2c78ac1f7",
+  "pass": true
+}

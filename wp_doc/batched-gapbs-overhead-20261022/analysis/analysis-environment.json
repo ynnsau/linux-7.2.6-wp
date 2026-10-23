@@ -1,0 +1,6 @@
+{
+  "python": "3.9.6 (default, Dec  2 2025, 07:27:58) \n[Clang 17.0.0 (clang-1700.6.3.2)]",
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "matplotlib": "3.8.2",
+  "numpy": "1.26.4"
+}
