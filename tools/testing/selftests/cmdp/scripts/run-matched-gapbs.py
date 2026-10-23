@@ -39,6 +39,7 @@ validator = load('matched_validator', 'validate-run.py')
 save, output, now, sha = old.save, old.output, old.now, prepare.sha
 KERNEL_COMMIT = '0b4d4a2a6174dc5de227252e5d900121b5fd9cb8'
 CELLS = [(app, t) for app in ('bfs', 'pr', 'cc', 'bc') for t in (1, 4)]
+HISTORY_BYTES_PER_PAGE = 192
 SEED = 20261022
 
 
@@ -328,7 +329,7 @@ class Campaign:
             assert dirty['samples'] > 0 and dirty['metadata_bytes'] > 0
             assert dirty['passes_started'] == final['passes_started']
             assert dirty['passes_completed'] == final['passes_completed']
-            assert dirty['metadata_bytes'] == final['history_entries'] * 192
+            assert dirty['metadata_bytes'] == final['history_entries'] * HISTORY_BYTES_PER_PAGE
             assert len([r for r in records if r['event'] == 'stop_request']) == 1
             assert len([r for r in records if r['event'] == 'stop_return']) == 1
             if mode == 'B':
@@ -497,7 +498,7 @@ class Campaign:
                        measured_runs=len(frozen['schedule']), runs=self.summaries)
         summary['pass'] = True
         save(self.base / 'campaign-summary.json', summary)
-        self.state('complete', passed=True, measured_completed=144)
+        self.state('complete', passed=True, measured_completed=len(frozen['schedule']))
         (self.base / 'campaign.exit').write_text('0\n')
 
     def failure(self, exc):
