@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Restricted native x86 CMD-P experiment. No device protocol is implemented. */
+#include <linux/bitmap.h>
 #include <linux/capability.h>
 #include <linux/cmdp.h>
 #include <linux/completion.h>
@@ -30,6 +31,7 @@
 #include <linux/uaccess.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/xarray.h>
+#include <linux/vmalloc.h>
 #include <uapi/linux/cmdp.h>
 
 #include <asm/tlbflush.h>
@@ -132,14 +134,36 @@ struct cmdp_session {
 };
 static struct cmdp_session *cmdp_owner;
 
-#define CMDP_MON_BATCH 64
+#define CMDP_MON_HOLD_NS (20ULL * NSEC_PER_MSEC)
 #define CMDP_MON_MAX_COHORTS 4096
 #define CMDP_MON_MAX_PAGES (16U * 1024 * 1024)
+/* Public query headers/addresses are materialized only for ioctl replies.
+ * Hot observation fields precede episode/reporting fields (160 bytes/page).
+ * 128 adjacent histories share one exact-page allocation; one XArray lookup
+ * reaches a 2 MiB region, and the scanner caches that result for the chunk.
+ */
+#define CMDP_REGION_SHIFT 21
+#define CMDP_REGION_PAGES (1U << (CMDP_REGION_SHIFT - PAGE_SHIFT))
+#define CMDP_HISTORY_BLOCK 128U
 struct cmdp_history {
-	struct cmdp_monitor_page page;
-	struct cmdp_monitor_dirty_page dirty;
+	struct {
+		u32 valid, last_dirty;
+		u64 pfn, quiet_since_ns, qualified_ns;
+		u64 epoch_id, last_sample_ns, last_dirty_ns, samples, dirty, resets;
+	} dirty;
 	u64 observation_seq;
 	bool continuous;
+	struct {
+		u32 state, reason;
+		u64 lifetime_id, arm_generation, pass_id;
+		u64 pfn, armed_ns, terminal_ns, arm_count;
+	} page;
+};
+struct cmdp_region {
+	DECLARE_BITMAP(present, CMDP_REGION_PAGES);
+	DECLARE_BITMAP(armed, CMDP_REGION_PAGES);
+	struct cmdp_history *blocks[CMDP_REGION_PAGES / CMDP_HISTORY_BLOCK];
+	u32 active;
 };
 struct cmdp_cohort {
 	struct cmdp_monitor_pass report;
@@ -165,10 +189,19 @@ struct cmdp_arm_work {
 struct cmdp_scan_batch {
 	unsigned long start, end;
 	unsigned int nr_dirty, nr_arm;
-	struct cmdp_dirty_reset dirty[CMDP_MON_BATCH];
-	struct cmdp_arm_work arm[CMDP_MON_BATCH];
+	struct cmdp_dirty_reset *dirty;
+	struct cmdp_arm_work *arm;
+	u64 hold_start;
+	bool time_limit;
 	struct cmdp_monitor_pass counts;
 	u64 lookups, active_skips;
+	struct cmdp_region *region;
+	unsigned long region_index;
+	bool region_cached;
+	pmd_t *pmd;
+	unsigned long pmd_index;
+	u64 region_lookups, region_full_skips, region_skip_pages, active_run_skips;
+	u64 pmd_walks, pmd_cache_hits;
 };
 struct cmdp_monitor {
 	/* ctl serializes setup; scan serializes worker and synchronous scans. */
@@ -177,12 +210,14 @@ struct cmdp_monitor {
 	spinlock_t lock;
 	struct delayed_work work;
 	struct cmdp_session *session;
-	struct xarray history;
+	struct xarray regions;
+	u64 history_slots;
 	struct xarray cohorts;
 	struct cmdp_monitor_status status;
 	struct cmdp_monitor_progress progress;
 	struct cmdp_monitor_dirty_status dirty;
 	struct cmdp_monitor_diagnostics diagnostics;
+	struct cmdp_monitor_batch_status batch_status;
 	struct cmdp_cohort *current_cohort;
 	u64 next_lifetime;
 	u64 account_ns;
@@ -194,6 +229,109 @@ struct cmdp_monitor {
 	struct cmdp_monitor_test_batch test_batch;
 #endif
 };
+/* Blocks and regions are never removed until the notifier and worker have
+ * drained. m->lock protects present/armed bits and the contents of histories.
+ */
+static struct cmdp_history *cmdp_region_history(struct cmdp_region *r,
+		unsigned long addr)
+{
+	unsigned int slot = (addr >> PAGE_SHIFT) & (CMDP_REGION_PAGES - 1);
+
+	if (!r || !test_bit(slot, r->present))
+		return NULL;
+	return &r->blocks[slot / CMDP_HISTORY_BLOCK][slot % CMDP_HISTORY_BLOCK];
+}
+
+static struct cmdp_history *cmdp_history_lookup(struct cmdp_monitor *m,
+		unsigned long addr)
+{
+	return cmdp_region_history(xa_load(&m->regions, addr >> CMDP_REGION_SHIFT), addr);
+}
+
+static void cmdp_history_block_free(void *block)
+{
+	if (is_vmalloc_addr(block))
+		vfree(block);
+	else if (block)
+		free_pages_exact(block, CMDP_HISTORY_BLOCK * sizeof(struct cmdp_history));
+}
+
+/* Called only by the serialized scanner, with mmap/VMA write exclusion.
+ * Reserve slots as well as live histories: sparse address spaces cannot
+ * multiply metadata allocation beyond max_history rounded to one block.
+ */
+static struct cmdp_history *cmdp_history_create(struct cmdp_monitor *m,
+		struct cmdp_scan_batch *b, unsigned long addr)
+{
+	struct cmdp_region *r = b->region;
+	struct cmdp_history *block, *h;
+	unsigned int slot = (addr >> PAGE_SHIFT) & (CMDP_REGION_PAGES - 1);
+	unsigned int group = slot / CMDP_HISTORY_BLOCK;
+	unsigned long flags;
+	bool new_region = !r;
+	size_t bytes = CMDP_HISTORY_BLOCK * sizeof(*h);
+
+	if (!r || !r->blocks[group]) {
+		if (m->history_slots >= round_up(m->max_history, CMDP_HISTORY_BLOCK))
+			return NULL;
+		if (!r) {
+			r = kzalloc_obj(*r);
+			if (!r)
+				return NULL;
+		}
+		/* Exact pages avoid slab size-class rounding; vmalloc is the
+		 * fragmentation fallback, outside all spin/PTE locks.
+		 */
+		block = alloc_pages_exact(bytes, GFP_KERNEL | __GFP_ZERO |
+					 __GFP_NOWARN | __GFP_NORETRY);
+		if (!block)
+			block = vzalloc(bytes);
+		if (!block) {
+			if (new_region)
+				kfree(r);
+			return NULL;
+		}
+		if (new_region && xa_err(xa_store(&m->regions,
+				addr >> CMDP_REGION_SHIFT, r, GFP_KERNEL))) {
+			cmdp_history_block_free(block);
+			kfree(r);
+			return NULL;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		r->blocks[group] = block;
+		m->history_slots += CMDP_HISTORY_BLOCK;
+		m->batch_status.history_allocated_bytes += PAGE_ALIGN(bytes);
+		if (new_region) {
+			m->batch_status.history_regions++;
+			m->batch_status.history_allocated_bytes += ksize(r);
+		}
+		spin_unlock_irqrestore(&m->lock, flags);
+		b->region = r;
+	}
+	h = &r->blocks[group][slot % CMDP_HISTORY_BLOCK];
+	spin_lock_irqsave(&m->lock, flags);
+	__set_bit(slot, r->present);
+	m->status.history_entries++;
+	m->batch_status.history_payload_bytes += sizeof(*h);
+	spin_unlock_irqrestore(&m->lock, flags);
+	return h;
+}
+
+static void cmdp_region_set_armed(struct cmdp_monitor *m,
+		unsigned long addr, bool armed)
+{
+	struct cmdp_region *r = xa_load(&m->regions, addr >> CMDP_REGION_SHIFT);
+	unsigned int slot = (addr >> PAGE_SHIFT) & (CMDP_REGION_PAGES - 1);
+
+	lockdep_assert_held(&m->lock);
+	if (WARN_ON_ONCE(!r || !test_bit(slot, r->present)))
+		return;
+	if (armed && !test_and_set_bit(slot, r->armed))
+		r->active++;
+	else if (!armed && test_and_clear_bit(slot, r->armed))
+		r->active--;
+}
+
 static atomic64_t cmdp_monitor_ids = ATOMIC64_INIT(0);
 static void cmdp_monitor_terminal(struct cmdp_entry *e, const char *reason);
 static void cmdp_monitor_armed(struct cmdp_entry *e);
@@ -1456,6 +1594,7 @@ static void cmdp_monitor_armed(struct cmdp_entry *e)
 	cmdp_dirty_invalidate_locked(m, h);
 	h->page.pfn = e->pfn;
 	h->page.state = CMDP_MON_PAGE_ARMED;
+	cmdp_region_set_armed(m, e->aliases[0].addr, true);
 	h->page.reason = CMDP_MON_NONE;
 	h->page.arm_generation = e->generation;
 	h->page.pass_id = e->cohort->report.id;
@@ -1516,6 +1655,7 @@ static void cmdp_monitor_terminal(struct cmdp_entry *e, const char *why)
 	cmdp_dirty_invalidate_locked(m, h);
 	if (m->dirty.mode && reason == CMDP_MON_WRITE)
 		m->dirty.wp_resets++;
+	cmdp_region_set_armed(m, e->aliases[0].addr, false);
 	h->page.reason = reason;
 	h->page.terminal_ns = now;
 	h->page.state = reason == CMDP_MON_WRITE ? CMDP_MON_PAGE_OFF_WRITE :
@@ -1531,34 +1671,48 @@ static void cmdp_monitor_invalidate_history_count(struct cmdp_session *s,
 		unsigned long start, unsigned long end, u64 *observations, u64 *histories)
 {
 	struct cmdp_monitor *m = s->monitor;
-	struct cmdp_history *h;
-	unsigned long index, flags;
+	struct cmdp_region *r;
+	unsigned long index, flags, slot, first, last;
 
 	if (!m || start >= end)
 		return;
-	/* No deletions while this session/notifier exists; lockless XA iteration
-	 * is safe even when an insertion races an unrelated invalidation.
+	/* Regions and blocks remain allocated for the lifetime of the session.
+	 * Test presence under m->lock; insertion publishes the zeroed block
+	 * before its first present bit. Each IRQ-disabled section is one slot.
 	 */
-	xa_for_each_range(&m->history, index, h, start >> PAGE_SHIFT,
-			  (end - 1) >> PAGE_SHIFT) {
-		spin_lock_irqsave(&m->lock, flags);
-		if (h->dirty.valid) {
-			m->dirty.invalidations++;
-			if (observations)
-				(*observations)++;
+	xa_for_each_range(&m->regions, index, r, start >> CMDP_REGION_SHIFT,
+			  (end - 1) >> CMDP_REGION_SHIFT) {
+		first = index == (start >> CMDP_REGION_SHIFT) ?
+			(start >> PAGE_SHIFT) & (CMDP_REGION_PAGES - 1) : 0;
+		last = index == ((end - 1) >> CMDP_REGION_SHIFT) ?
+			(((end - 1) >> PAGE_SHIFT) & (CMDP_REGION_PAGES - 1)) + 1 :
+			CMDP_REGION_PAGES;
+		for (slot = first; slot < last; slot++) {
+			struct cmdp_history *h;
+
+			spin_lock_irqsave(&m->lock, flags);
+			if (!test_bit(slot, r->present)) {
+				spin_unlock_irqrestore(&m->lock, flags);
+				continue;
+			}
+			h = &r->blocks[slot / CMDP_HISTORY_BLOCK][slot % CMDP_HISTORY_BLOCK];
+			if (h->dirty.valid) {
+				m->dirty.invalidations++;
+				if (observations)
+					(*observations)++;
+			}
+			cmdp_dirty_invalidate_locked(m, h);
+			if (h->continuous) {
+				h->continuous = false;
+				m->status.history_resets++;
+				if (histories)
+					(*histories)++;
+			}
+			if (h->page.state != CMDP_MON_PAGE_ARMED &&
+			    h->page.state != CMDP_MON_PAGE_STOPPED)
+				h->page.state = CMDP_MON_PAGE_INVALIDATED;
+			spin_unlock_irqrestore(&m->lock, flags);
 		}
-		cmdp_dirty_invalidate_locked(m, h);
-		if (h->continuous) {
-			h->continuous = false;
-			m->status.history_resets++;
-			if (histories)
-				(*histories)++;
-		}
-		if (h->page.state != CMDP_MON_PAGE_ARMED &&
-		    h->page.state != CMDP_MON_PAGE_STOPPED) {
-			h->page.state = CMDP_MON_PAGE_INVALIDATED;
-		}
-		spin_unlock_irqrestore(&m->lock, flags);
 	}
 }
 
@@ -1665,21 +1819,26 @@ void cmdp_mm_stop(struct mm_struct *mm, unsigned int reason)
  * The PTE lock stabilizes the mapping reference while get_page adds ours.
  * Never allocate or split page tables, change A/D bits, or fault pages in.
  */
-static struct page *cmdp_monitor_get_page(struct vm_area_struct *vma,
-		unsigned long addr, bool *resident, int *skip)
+/* The PMD table location is valid only during this mmap/VMA write chunk.
+ * Re-read its contents for every PTE mapping; never cache a PTE or PTL.
+ */
+static pmd_t *cmdp_monitor_pmd(struct vm_area_struct *vma, unsigned long addr,
+		struct cmdp_scan_batch *b, bool *resident, int *skip)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pgd_t *pgd = pgd_offset(mm, addr);
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
-	pte_t *ptep, pte;
-	spinlock_t *ptl;
-	struct page *page = NULL;
 
 	mmap_assert_write_locked(mm);
-	*resident = false;
-	*skip = CMDP_MON_SKIP_NONRESIDENT;
+	if (b && b->pmd && b->pmd_index == addr >> PMD_SHIFT) {
+		pmd = b->pmd;
+		b->pmd_cache_hits++;
+		goto check_pmd;
+	}
+	if (b)
+		b->pmd_walks++;
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return NULL;
 	p4d = p4d_offset(pgd, addr);
@@ -1694,12 +1853,35 @@ static struct page *cmdp_monitor_get_page(struct vm_area_struct *vma,
 	if (pud_none(*pud) || pud_bad(*pud))
 		return NULL;
 	pmd = pmd_offset(pud, addr);
+	if (b) {
+		b->pmd = pmd;
+		b->pmd_index = addr >> PMD_SHIFT;
+	}
+check_pmd:
 	if (pmd_leaf(*pmd)) {
 		*resident = pmd_present(*pmd);
 		*skip = CMDP_MON_SKIP_PAGE_TYPE;
 		return NULL;
 	}
 	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return NULL;
+	return pmd;
+}
+
+static struct page *cmdp_monitor_get_page_cached(struct vm_area_struct *vma,
+		unsigned long addr, bool *resident, int *skip, struct cmdp_scan_batch *b)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pmd_t *pmd;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+	struct page *page = NULL;
+
+	mmap_assert_write_locked(mm);
+	*resident = false;
+	*skip = CMDP_MON_SKIP_NONRESIDENT;
+	pmd = cmdp_monitor_pmd(vma, addr, b, resident, skip);
+	if (!pmd)
 		return NULL;
 	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!ptep)
@@ -1725,14 +1907,20 @@ static struct page *cmdp_monitor_get_page(struct vm_area_struct *vma,
 	return page;
 }
 
+static struct page *cmdp_monitor_get_page(struct vm_area_struct *vma,
+		unsigned long addr, bool *resident, int *skip)
+{
+	return cmdp_monitor_get_page_cached(vma, addr, resident, skip, NULL);
+}
+
 static int cmdp_monitor_probe(struct vm_area_struct *vma, unsigned long addr,
-		bool *resident, struct page **result)
+		bool *resident, struct page **result, struct cmdp_scan_batch *b)
 {
 	struct page *page = NULL;
 	struct folio *folio;
 	int ret;
 
-	page = cmdp_monitor_get_page(vma, addr, resident, &ret);
+	page = cmdp_monitor_get_page_cached(vma, addr, resident, &ret, b);
 	if (!page)
 		return ret;
 
@@ -1819,7 +2007,11 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 {
 	struct page *page = *pagep;
 	struct folio *folio = page_folio(page);
-	struct page_vma_mapped_walk pvmw;
+	pmd_t *pmd;
+	pte_t *ptep;
+	spinlock_t *ptl;
+	bool resident;
+	int skip;
 	unsigned long flags, pfn = page_to_pfn(page);
 	u64 start = ktime_get_ns(), seq, now, reset_ns = 0;
 	bool dirty, reset, valid;
@@ -1856,15 +2048,17 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 		rejected = CMDP_MON_UNKNOWN_PINS;
 		goto unlock_folio;
 	}
-	pvmw = (struct page_vma_mapped_walk) {
-		.pfn = pfn, .nr_pages = 1, .pgoff = folio_pgoff(folio),
-		.vma = vma, .address = addr, .flags = PVMW_SYNC,
-	};
-	if (!page_vma_mapped_walk(&pvmw))
+	/* Reuse the chunk's upper-table lookup, but reacquire PTL and validate
+	 * the exact normal page after folio locking. mmap write excludes table
+	 * teardown; no PTE pointer survives this section.
+	 */
+	pmd = cmdp_monitor_pmd(vma, addr, b, &resident, &skip);
+	if (!pmd)
 		goto unlock_folio;
-	if (!pvmw.pte || pvmw.address != addr)
-		goto unlock_pte;
-	pte = ptep_get(pvmw.pte);
+	ptep = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	if (!ptep)
+		goto unlock_folio;
+	pte = ptep_get(ptep);
 	if (!cmdp_dirty_pte_supported(pte)) {
 		rejected = cmdp_unknown_pte(pte);
 		goto unlock_pte;
@@ -1883,7 +2077,7 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 
 		folio_mark_dirty(folio);
 		dirty |= test_and_clear_bit(cmdp_dirty_pte_bit(pte),
-					   (unsigned long *)&pvmw.pte->pte);
+					   (unsigned long *)&ptep->pte);
 		reset_ns = ktime_get_ns() - before;
 		spin_lock_irqsave(&m->lock, flags);
 		/* Do not expose the obsolete certificate while a reset is pending.
@@ -1898,7 +2092,7 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 		m->dirty.reset_ns += reset_ns;
 		m->dirty.sample_ns += ktime_get_ns() - start;
 		spin_unlock_irqrestore(&m->lock, flags);
-		page_vma_mapped_walk_done(&pvmw);
+		pte_unmap_unlock(ptep, ptl);
 		*pagep = NULL; /* batch owns the locked folio and probe reference */
 		return 0;
 	}
@@ -1907,11 +2101,11 @@ static int cmdp_monitor_sample_dirty(struct cmdp_monitor *m,
 	ret = cmdp_dirty_sample_record(m, h, pfn, seq, now, dirty, false, valid);
 	m->dirty.sample_ns += ktime_get_ns() - start;
 	spin_unlock_irqrestore(&m->lock, flags);
-	page_vma_mapped_walk_done(&pvmw);
+	pte_unmap_unlock(ptep, ptl);
 	folio_unlock(folio);
 	return ret;
 unlock_pte:
-	page_vma_mapped_walk_done(&pvmw);
+	pte_unmap_unlock(ptep, ptl);
 unlock_folio:
 	folio_unlock(folio);
 unknown:
@@ -1953,45 +2147,6 @@ static void cmdp_batch_test_wait(struct cmdp_monitor_test_batch *test)
 #endif
 }
 
-static void cmdp_monitor_flush_dirty(struct cmdp_monitor *m,
-		struct cmdp_scan_batch *b)
-{
-	unsigned long flags;
-	unsigned int i;
-	u64 start, now, flush_ns;
-	struct cmdp_monitor_test_batch test;
-
-	if (!b->nr_dirty)
-		return;
-	test = cmdp_batch_test_take(m, b, CMDP_MON_TEST_BATCH_DIRTY);
-	cmdp_batch_test_wait(&test);
-	start = ktime_get_ns();
-	/* Includes architectural secondary-TLB invalidation, just as the old
-	 * per-page helper did. Required even for initially clean new epochs.
-	 */
-	flush_tlb_mm_range(m->session->mm, b->start, b->end, PAGE_SHIFT, false);
-	now = ktime_get_ns();
-	flush_ns = now - start;
-	atomic64_inc(&cmdp_stats[DIRTY_FLUSH_BATCHES]);
-	atomic64_add(b->nr_dirty, &cmdp_stats[DIRTY_FLUSH_PAGES]);
-	spin_lock_irqsave(&m->lock, flags);
-	m->dirty.flush_ns += flush_ns;
-	for (i = 0; i < b->nr_dirty; i++) {
-		struct cmdp_dirty_reset *r = &b->dirty[i];
-
-		cmdp_dirty_sample_record(m, r->history, page_to_pfn(r->page),
-				r->seq, now, r->dirty, true, r->valid);
-	}
-	/* Count shared flush/publication work once, not once per page. */
-	m->dirty.sample_ns += ktime_get_ns() - start;
-	spin_unlock_irqrestore(&m->lock, flags);
-	for (i = 0; i < b->nr_dirty; i++) {
-		folio_unlock(page_folio(b->dirty[i].page));
-		put_page(b->dirty[i].page);
-	}
-	b->nr_dirty = 0;
-}
-
 static unsigned int cmdp_monitor_failure(int ret, const char *why)
 {
 	if (ret == -ENOMEM || ret == -ENOSPC)
@@ -2029,32 +2184,39 @@ static void cmdp_monitor_arm_result(struct cmdp_monitor *m,
 	spin_unlock_irqrestore(&m->lock, flags);
 }
 
-static void cmdp_monitor_flush_arm(struct cmdp_monitor *m,
+/* Dirty resets and permission changes share one completion boundary.
+ * D and A are disjoint sets retained under mmap/VMA and folio exclusion.
+ * A pending D epoch and ARMING entry never authorize use before the flush.
+ */
+static void cmdp_monitor_flush_batch(struct cmdp_monitor *m,
 		struct cmdp_scan_batch *b)
 {
 	struct cmdp_session *s = m->session;
 	struct mmu_notifier_range range;
-	unsigned int i, protected = 0;
-	struct cmdp_monitor_test_batch test;
+	struct cmdp_monitor_test_batch test = { };
+	unsigned int i, j, protected = 0;
+	unsigned long flags;
+	u64 before, completed = 0, elapsed = 0;
 
-	if (!b->nr_arm)
+	if (!b->nr_dirty && !b->nr_arm)
 		return;
-	test = cmdp_batch_test_take(m, b, CMDP_MON_TEST_BATCH_ARM);
-	/* Monitor candidates have exactly one alias, checked against this
-	 * bounded VMA range during preparation. No PTL/rmap lock is held here.
-	 * Legacy multi-alias ARM keeps its existing synchronous per-alias path.
-	 */
-	mmu_notifier_range_init_owner(&range, MMU_NOTIFY_PROTECTION_PAGE, 0,
-			s->mm, b->start, b->end, s);
-	mmu_notifier_invalidate_range_start(&range);
-	raw_write_seqcount_begin(&s->mm->write_protect_seq);
-	for (i = 0; i < b->nr_arm; i++) {
-		struct cmdp_arm_work *w = &b->arm[i];
+	if (b->nr_dirty)
+		test = cmdp_batch_test_take(m, b, CMDP_MON_TEST_BATCH_DIRTY);
+	if (b->nr_arm) {
+		if (!test.phase)
+			test = cmdp_batch_test_take(m, b, CMDP_MON_TEST_BATCH_ARM);
+		mmu_notifier_range_init_owner(&range, MMU_NOTIFY_PROTECTION_PAGE, 0,
+				s->mm, b->start, b->end, s);
+		mmu_notifier_invalidate_range_start(&range);
+		raw_write_seqcount_begin(&s->mm->write_protect_seq);
+		for (i = 0; i < b->nr_arm; i++) {
+			struct cmdp_arm_work *w = &b->arm[i];
 
-		w->error = cmdp_protect_alias(w->entry, &w->entry->aliases[0], true);
-		protected += w->entry->protected;
-		if (test.abort_after && protected >= test.abort_after)
-			break;
+			w->error = cmdp_protect_alias(w->entry, &w->entry->aliases[0], true);
+			protected += w->entry->protected;
+			if (test.abort_after && protected >= test.abort_after)
+				break;
+		}
 	}
 	cmdp_batch_test_wait(&test);
 	if (test.abort_after) {
@@ -2063,20 +2225,67 @@ static void cmdp_monitor_flush_arm(struct cmdp_monitor *m,
 			b->arm[i].error = -EIO;
 		}
 	}
-	if (protected) {
+	/* Never omit a dirty reset or a partially failed protection from drain. */
+	if (b->nr_dirty || protected) {
+		before = ktime_get_ns();
 		flush_tlb_mm_range(s->mm, b->start, b->end, PAGE_SHIFT, false);
+		completed = ktime_get_ns();
+		elapsed = completed - before;
+	}
+	if (b->nr_arm) {
+		smp_mb();
+		for (i = 0; i < b->nr_arm; i++)
+			cmdp_arm_check_pins(&b->arm[i]);
+		raw_write_seqcount_end(&s->mm->write_protect_seq);
+		mmu_notifier_invalidate_range_end(&range);
+	}
+	/* Publication/accounting and any yielding happen outside fast-pin
+	 * exclusion. Bound each IRQ-disabled history publication section.
+	 */
+	if (b->nr_dirty) {
+		atomic64_inc(&cmdp_stats[DIRTY_FLUSH_BATCHES]);
+		atomic64_add(b->nr_dirty, &cmdp_stats[DIRTY_FLUSH_PAGES]);
+		before = ktime_get_ns();
+		for (i = 0; i < b->nr_dirty; i = j) {
+			spin_lock_irqsave(&m->lock, flags);
+			for (j = i; j < min(i + 64, b->nr_dirty); j++) {
+				struct cmdp_dirty_reset *r = &b->dirty[j];
+
+				cmdp_dirty_sample_record(m, r->history, page_to_pfn(r->page),
+						r->seq, completed, r->dirty, true, r->valid);
+			}
+			spin_unlock_irqrestore(&m->lock, flags);
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		m->dirty.flush_ns += elapsed;
+		m->dirty.sample_ns += elapsed + ktime_get_ns() - before;
+		spin_unlock_irqrestore(&m->lock, flags);
+		for (i = 0; i < b->nr_dirty; i++) {
+			folio_unlock(page_folio(b->dirty[i].page));
+			put_page(b->dirty[i].page);
+		}
+	}
+	if (protected) {
 		atomic64_inc(&cmdp_stats[ARM_FLUSH_BATCHES]);
 		atomic64_add(protected, &cmdp_stats[ARM_FLUSH_PAGES]);
 	}
-	/* All permission changes and shootdowns precede every final ref/pin
-	 * check. Complete all checks before ending the fast-FOLL_PIN sequence;
-	 * only then may any backend publication or wait occur.
-	 */
-	smp_mb();
-	for (i = 0; i < b->nr_arm; i++)
-		cmdp_arm_check_pins(&b->arm[i]);
-	raw_write_seqcount_end(&s->mm->write_protect_seq);
-	mmu_notifier_invalidate_range_end(&range);
+	spin_lock_irqsave(&m->lock, flags);
+	if (b->nr_dirty || protected) {
+		struct cmdp_monitor_batch_status *st = &m->batch_status;
+
+		st->flush_calls++;
+		st->shared_flush_calls += b->nr_dirty && protected;
+		st->dirty_only_flush_calls += b->nr_dirty && !protected;
+		st->wp_only_flush_calls += !b->nr_dirty && protected;
+		st->flush_ns += elapsed;
+		st->dirty_pages += b->nr_dirty;
+		st->wp_pages += protected;
+		st->max_dirty_pages = max_t(u64, st->max_dirty_pages, b->nr_dirty);
+		st->max_wp_pages = max_t(u64, st->max_wp_pages, protected);
+		st->max_span_pages = max_t(u64, st->max_span_pages,
+				(b->end - b->start) >> PAGE_SHIFT);
+	}
+	spin_unlock_irqrestore(&m->lock, flags);
 	for (i = 0; i < b->nr_arm; i++) {
 		struct cmdp_arm_work *w = &b->arm[i];
 		struct cmdp_history *h = w->entry->history;
@@ -2089,7 +2298,7 @@ static void cmdp_monitor_flush_arm(struct cmdp_monitor *m,
 		cmdp_arm_publish(w);
 		cmdp_monitor_arm_result(m, b, w, h);
 	}
-	b->nr_arm = 0;
+	/* Counts are retained until the caller records chunk termination. */
 }
 
 /* Only scan-local fields are accumulated here. Admission/terminal counters
@@ -2107,6 +2316,12 @@ static void cmdp_monitor_batch_counts(struct cmdp_monitor *m,
 	c->report.resident_pages += b->counts.resident_pages;
 	c->report.eligible_pages += b->counts.eligible_pages;
 	c->report.already_armed += b->counts.already_armed;
+	m->batch_status.region_lookups += b->region_lookups;
+	m->batch_status.region_full_skips += b->region_full_skips;
+	m->batch_status.region_skip_pages += b->region_skip_pages;
+	m->batch_status.active_run_skips += b->active_run_skips;
+	m->batch_status.pmd_walks += b->pmd_walks;
+	m->batch_status.pmd_cache_hits += b->pmd_cache_hits;
 	for (i = 0; i < ARRAY_SIZE(c->report.skipped); i++)
 		c->report.skipped[i] += b->counts.skipped[i];
 	spin_unlock_irqrestore(&m->lock, flags);
@@ -2173,6 +2388,15 @@ static bool cmdp_monitor_scan_lock(struct cmdp_monitor *m)
 	return acquired;
 }
 
+static void cmdp_scan_batch_free(struct cmdp_scan_batch *b)
+{
+	if (!b)
+		return;
+	kvfree(b->dirty);
+	kvfree(b->arm);
+	kfree(b);
+}
+
 static int cmdp_monitor_scan(struct cmdp_monitor *m)
 {
 	struct cmdp_session *s = m->session;
@@ -2182,15 +2406,21 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 	struct cmdp_history *h;
 	struct vm_area_struct *vma;
 	unsigned long addr = 0, flags;
-	unsigned int batch, skip;
+	unsigned int batch, skip, window_pages;
 	bool resident;
 	int ret = 0, probe;
 
 	c = kzalloc_obj(*c);
 	b = kzalloc_obj(*b);
-	if (!c || !b) {
+	if (b) {
+		b->dirty = kvcalloc(m->batch_status.dirty_batch_pages,
+				sizeof(*b->dirty), GFP_KERNEL);
+		b->arm = kvcalloc(m->batch_status.wp_batch_pages,
+				sizeof(*b->arm), GFP_KERNEL);
+	}
+	if (!c || !b || !b->dirty || !b->arm) {
 		kfree(c);
-		kfree(b);
+		cmdp_scan_batch_free(b);
 		spin_lock_irqsave(&m->lock, flags);
 		m->status.resource_failures++;
 		spin_unlock_irqrestore(&m->lock, flags);
@@ -2204,7 +2434,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			m->status.resource_failures++;
 		spin_unlock_irqrestore(&m->lock, flags);
 		kfree(c);
-		kfree(b);
+		cmdp_scan_batch_free(b);
 		return ret;
 	}
 	c->report.id = m->status.passes_started + 1;
@@ -2216,7 +2446,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 		m->status.resource_failures++;
 		spin_unlock_irqrestore(&m->lock, flags);
 		kfree(c);
-		kfree(b);
+		cmdp_scan_batch_free(b);
 		return ret;
 	}
 	spin_lock_irqsave(&m->lock, flags);
@@ -2225,6 +2455,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 		m->dirty.passes_started++;
 	m->current_cohort = c;
 	spin_unlock_irqrestore(&m->lock, flags);
+	window_pages = max(m->batch_status.dirty_batch_pages, m->batch_status.wp_batch_pages);
 	/* Pending allocation/putback batches also own transient references.
 	 * Flush once per pass; unlike remote GUP, our lookup adds no new ones.
 	 */
@@ -2246,10 +2477,24 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			break;
 		}
 		b->nr_dirty = b->nr_arm = 0;
+		b->hold_start = ktime_get_ns();
+		b->time_limit = false;
 		b->counts = (struct cmdp_monitor_pass) { };
 		b->lookups = b->active_skips = 0;
+		b->region_cached = false;
+		b->pmd = NULL;
+		b->region_lookups = b->region_full_skips = b->region_skip_pages = 0;
+		b->active_run_skips = b->pmd_walks = b->pmd_cache_hits = 0;
 		vma = NULL;
-		for (batch = 0; batch < CMDP_MON_BATCH && addr < TASK_SIZE_MAX; batch++) {
+		for (batch = 0; batch < window_pages && addr < TASK_SIZE_MAX; batch++) {
+			if (b->nr_dirty >= m->batch_status.dirty_batch_pages ||
+			    b->nr_arm >= m->batch_status.wp_batch_pages)
+				break;
+			if (batch && !(batch % 64) &&
+			    ktime_get_ns() - b->hold_start >= CMDP_MON_HOLD_NS) {
+				b->time_limit = true;
+				break;
+			}
 			page = NULL;
 			if (READ_ONCE(s->closing) ||
 			    READ_ONCE(m->status.state) >= CMDP_MON_STOPPING) {
@@ -2267,7 +2512,7 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			addr = max(addr, vma->vm_start);
 			if (!batch) {
 				b->start = addr;
-				b->end = min(vma->vm_end, addr + CMDP_MON_BATCH * PAGE_SIZE);
+				b->end = min(vma->vm_end, addr + window_pages * PAGE_SIZE);
 			}
 			if (!(vma->vm_flags & VM_WRITE)) {
 				addr = vma->vm_end;
@@ -2295,21 +2540,45 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			 * it directly; no page-table walk or reference is needed.
 			 */
 			vma_start_write(vma);
-			h = xa_load(&m->history, addr >> PAGE_SHIFT);
+			if (!b->region_cached || b->region_index != addr >> CMDP_REGION_SHIFT) {
+				b->region_index = addr >> CMDP_REGION_SHIFT;
+				b->region = xa_load(&m->regions, b->region_index);
+				b->region_cached = true;
+				b->region_lookups++;
+			}
 			spin_lock_irqsave(&m->lock, flags);
-			if (h && h->page.state == CMDP_MON_PAGE_ARMED) {
-				spin_unlock_irqrestore(&m->lock, flags);
-				b->counts.writable_pages++;
-				b->counts.examined_pages++;
-				b->counts.resident_pages++;
-				b->counts.eligible_pages++;
-				b->counts.already_armed++;
-				b->active_skips++;
-				goto next;
+			h = cmdp_region_history(b->region, addr);
+			if (b->region && b->region->active) {
+				unsigned long slot = (addr >> PAGE_SHIFT) & (CMDP_REGION_PAGES - 1);
+				unsigned long end_slot, end_addr, pages;
+
+				if (test_bit(slot, b->region->armed)) {
+					end_slot = find_next_zero_bit(b->region->armed,
+							CMDP_REGION_PAGES, slot);
+					end_addr = min(vma->vm_end, addr + (end_slot - slot) * PAGE_SIZE);
+					if (b->nr_dirty || b->nr_arm)
+						end_addr = min(end_addr, b->end);
+					pages = (end_addr - addr) >> PAGE_SHIFT;
+					b->region_full_skips += !slot && pages == CMDP_REGION_PAGES;
+					b->active_run_skips++;
+					b->region_skip_pages += pages;
+					spin_unlock_irqrestore(&m->lock, flags);
+					b->counts.writable_pages += pages;
+					b->counts.examined_pages += pages;
+					b->counts.resident_pages += pages;
+					b->counts.eligible_pages += pages;
+					b->counts.already_armed += pages;
+					b->active_skips += pages;
+					addr = end_addr;
+					/* A bulk jump terminates the chunk; no staged range
+					 * can extend beyond its original VMA/window.
+					 */
+					break;
+				}
 			}
 			spin_unlock_irqrestore(&m->lock, flags);
 			b->lookups++;
-			probe = cmdp_monitor_probe(vma, addr, &resident, &page);
+			probe = cmdp_monitor_probe(vma, addr, &resident, &page, b);
 			b->counts.writable_pages++;
 			b->counts.examined_pages++;
 			b->counts.resident_pages += resident;
@@ -2340,20 +2609,9 @@ static int cmdp_monitor_scan(struct cmdp_monitor *m)
 			}
 			spin_unlock_irqrestore(&m->lock, flags);
 			if (!h) {
-				h = kzalloc_obj(*h);
+				h = cmdp_history_create(m, b, addr);
 				if (!h)
 					goto resource;
-				h->page.addr = addr;
-				h->dirty.addr = addr;
-				probe = xa_err(xa_store(&m->history, addr >> PAGE_SHIFT,
-							h, GFP_KERNEL));
-				if (probe) {
-					kfree(h);
-					goto resource;
-				}
-				spin_lock_irqsave(&m->lock, flags);
-				m->status.history_entries++;
-				spin_unlock_irqrestore(&m->lock, flags);
 			}
 			if (m->dirty.mode) {
 				probe = cmdp_monitor_sample_dirty(m, vma, addr, &page, h, b);
@@ -2403,8 +2661,16 @@ next:
 		/* Also drain partial chunks on STOP/error before dropping mmap.
 		 * No deferred reset, ARMING entry or folio lock may escape here.
 		 */
-		cmdp_monitor_flush_dirty(m, b);
-		cmdp_monitor_flush_arm(m, b);
+		cmdp_monitor_flush_batch(m, b);
+		spin_lock_irqsave(&m->lock, flags);
+		m->batch_status.chunks++;
+		m->batch_status.limit_chunks +=
+			b->nr_dirty >= m->batch_status.dirty_batch_pages ||
+			b->nr_arm >= m->batch_status.wp_batch_pages;
+		m->batch_status.time_chunks += b->time_limit;
+		m->batch_status.max_hold_ns = max(m->batch_status.max_hold_ns,
+				ktime_get_ns() - b->hold_start);
+		spin_unlock_irqrestore(&m->lock, flags);
 		cmdp_monitor_batch_counts(m, c, b);
 		mmap_write_unlock(s->mm);
 		/* May run release notifier here. Never hold a monitor lock. */
@@ -2429,7 +2695,7 @@ next:
 	m->progress.scan_phase = CMDP_MON_SCAN_IDLE;
 	m->progress.phase_since_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&m->lock, flags);
-	kfree(b);
+	cmdp_scan_batch_free(b);
 	return ret;
 }
 
@@ -2674,7 +2940,7 @@ static int cmdp_monitor_page_snapshot(struct cmdp_monitor *m,
 	 * case. Other cases still have mmap/VMA exclusion, with no owned entry.
 	 */
 	spin_lock_irqsave(&m->lock, flags);
-	h = xa_load(&m->history, addr >> PAGE_SHIFT);
+	h = cmdp_history_lookup(m, addr);
 	if (h) {
 		out->history_state = h->page.state;
 		out->observation_valid = h->dirty.valid;
@@ -2691,7 +2957,7 @@ unsupported:
 	out->category = CMDP_MON_PTE_UNSUPPORTED;
 history:
 	spin_lock_irqsave(&m->lock, flags);
-	h = xa_load(&m->history, addr >> PAGE_SHIFT);
+	h = cmdp_history_lookup(m, addr);
 	if (h) {
 		out->history_state = h->page.state;
 		out->observation_valid = h->dirty.valid;
@@ -2850,6 +3116,8 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		struct cmdp_monitor_dirty_status dirty_status;
 		struct cmdp_monitor_dirty_page dirty_page;
 		struct cmdp_monitor_diagnostics diagnostics;
+		struct cmdp_monitor_batch_config batch_config;
+		struct cmdp_monitor_batch_status batch_status;
 		struct cmdp_monitor_page_snapshot snapshot;
 #ifdef CONFIG_CMDP_TEST
 		struct cmdp_monitor_test_batch test_batch;
@@ -2891,7 +3159,7 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		    data.test_batch.phase > CMDP_MON_TEST_BATCH_ARM ||
 		    data.test_batch.delay_ms > 1000 || data.test_batch.reserved ||
 		    cmdp_validate_addr(data.test_batch.addr) ||
-		    data.test_batch.abort_after > CMDP_MON_BATCH ||
+		    data.test_batch.abort_after > m->batch_status.wp_batch_pages ||
 		    (data.test_batch.abort_after &&
 		     data.test_batch.phase != CMDP_MON_TEST_BATCH_ARM)) {
 			ret = -EINVAL;
@@ -2910,6 +3178,48 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 		ret = cmdp_monitor_attach_target(m, &data.a);
+		break;
+	case CMDP_MON_BATCH_CONFIG:
+		if (copy_from_user(&data.batch_config, up, sizeof(data.batch_config))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (data.batch_config.size != sizeof(data.batch_config) ||
+		    data.batch_config.version != CMDP_MONITOR_VERSION ||
+		    data.batch_config.dirty_batch_pages > CMDP_BATCH_MAX ||
+		    data.batch_config.wp_batch_pages > CMDP_BATCH_MAX ||
+		    data.batch_config.reserved[0] || data.batch_config.reserved[1]) {
+			ret = -EINVAL;
+			break;
+		}
+		if (!m->session || m->status.state != CMDP_MON_ATTACHED ||
+		    m->scanning || m->status.passes_started) {
+			ret = -EBUSY;
+			break;
+		}
+		m->batch_status.dirty_batch_pages =
+			data.batch_config.dirty_batch_pages ?: CMDP_BATCH_DEFAULT;
+		m->batch_status.wp_batch_pages =
+			data.batch_config.wp_batch_pages ?: CMDP_BATCH_DEFAULT;
+		break;
+	case CMDP_MON_BATCH_STATUS:
+		if (copy_from_user(&data.batch_status, up, sizeof(data.batch_status))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (data.batch_status.size != sizeof(data.batch_status) ||
+		    data.batch_status.version != CMDP_MONITOR_VERSION) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		data.batch_status = m->batch_status;
+		data.batch_status.size = sizeof(data.batch_status);
+		data.batch_status.version = CMDP_MONITOR_VERSION;
+		data.batch_status.now_ns = ktime_get_ns();
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (copy_to_user(up, &data.batch_status, sizeof(data.batch_status)))
+			ret = -EFAULT;
 		break;
 	case CMDP_MON_DIRTY_CONFIG:
 		if (copy_from_user(&data.dirty_config, up, sizeof(data.dirty_config))) {
@@ -2970,13 +3280,24 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			ret = -EINVAL;
 			break;
 		}
-		h = xa_load(&m->history, data.dirty_page.addr >> PAGE_SHIFT);
+		spin_lock_irqsave(&m->lock, flags);
+		h = cmdp_history_lookup(m, data.dirty_page.addr);
 		if (!h) {
+			spin_unlock_irqrestore(&m->lock, flags);
 			ret = -ENOENT;
 			break;
 		}
-		spin_lock_irqsave(&m->lock, flags);
-		data.dirty_page = h->dirty;
+		data.dirty_page.pfn = h->dirty.pfn;
+		data.dirty_page.epoch_id = h->dirty.epoch_id;
+		data.dirty_page.quiet_since_ns = h->dirty.quiet_since_ns;
+		data.dirty_page.last_sample_ns = h->dirty.last_sample_ns;
+		data.dirty_page.last_dirty_ns = h->dirty.last_dirty_ns;
+		data.dirty_page.samples = h->dirty.samples;
+		data.dirty_page.dirty = h->dirty.dirty;
+		data.dirty_page.resets = h->dirty.resets;
+		data.dirty_page.qualified_ns = h->dirty.qualified_ns;
+		data.dirty_page.valid = h->dirty.valid;
+		data.dirty_page.last_dirty = h->dirty.last_dirty;
 		data.dirty_page.size = sizeof(data.dirty_page);
 		data.dirty_page.version = CMDP_MONITOR_VERSION;
 		if (m->status.state >= CMDP_MON_STOPPING)
@@ -3118,13 +3439,22 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			ret = -EINVAL;
 			break;
 		}
-		h = xa_load(&m->history, data.page.addr >> PAGE_SHIFT);
+		spin_lock_irqsave(&m->lock, flags);
+		h = cmdp_history_lookup(m, data.page.addr);
 		if (!h) {
+			spin_unlock_irqrestore(&m->lock, flags);
 			ret = -ENOENT;
 			break;
 		}
-		spin_lock_irqsave(&m->lock, flags);
-		data.page = h->page;
+		data.page.state = h->page.state;
+		data.page.reason = h->page.reason;
+		data.page.lifetime_id = h->page.lifetime_id;
+		data.page.arm_generation = h->page.arm_generation;
+		data.page.pass_id = h->page.pass_id;
+		data.page.pfn = h->page.pfn;
+		data.page.armed_ns = h->page.armed_ns;
+		data.page.terminal_ns = h->page.terminal_ns;
+		data.page.arm_count = h->page.arm_count;
 		data.page.size = sizeof(data.page);
 		data.page.version = CMDP_MONITOR_VERSION;
 		spin_unlock_irqrestore(&m->lock, flags);
@@ -3171,8 +3501,11 @@ static int cmdp_monitor_open(struct inode *inode, struct file *file)
 	mutex_init(&m->ctl);
 	mutex_init(&m->scan);
 	spin_lock_init(&m->lock);
-	xa_init(&m->history);
+	xa_init(&m->regions);
 	xa_init(&m->cohorts);
+	m->batch_status.dirty_batch_pages = CMDP_BATCH_DEFAULT;
+	m->batch_status.wp_batch_pages = CMDP_BATCH_DEFAULT;
+	m->batch_status.hold_target_ns = CMDP_MON_HOLD_NS;
 	INIT_DELAYED_WORK(&m->work, cmdp_monitor_work);
 	file->private_data = m;
 	return 0;
@@ -3201,11 +3534,16 @@ static int cmdp_monitor_release(struct inode *inode, struct file *file)
 		mmap_write_unlock(m->session->mm);
 		cmdp_session_close(m->session);
 	}
-	xa_for_each(&m->history, index, entry) {
-		kfree(entry);
+	xa_for_each(&m->regions, index, entry) {
+		struct cmdp_region *r = entry;
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(r->blocks); i++)
+			cmdp_history_block_free(r->blocks[i]);
+		kfree(r);
 		cond_resched();
 	}
-	xa_destroy(&m->history);
+	xa_destroy(&m->regions);
 	xa_for_each(&m->cohorts, index, entry) {
 		kfree(entry);
 		cond_resched();

@@ -160,7 +160,9 @@ struct cmdp_monitor_dirty_config {
  * reset_ns/flush_ns are subsets of sample_ns, all monotonic nanoseconds.
  * valid_observations counts retained OFF epochs, not pages proven clean now;
  * it becomes zero at STOP. metadata_bytes includes the complete history
- * objects, not XArray/cohort allocator overhead. Samples never expand the
+ * payload for retained pages (160 bytes each in the grouped implementation),
+ * not reserved slots, region headers, XArray or cohort allocator overhead.
+ * CMDP_MON_BATCH_STATUS reports reserved history allocation separately. Samples never expand the
  * existing supported CPU-writer contract to arbitrary kernel/DMA writers.
  */
 struct cmdp_monitor_dirty_status {
@@ -290,5 +292,33 @@ struct cmdp_monitor_test_batch {
 	__u32 abort_after, reserved;
 };
 #define CMDP_MON_TEST_BATCH _IOW(CMDP_IOC_MAGIC, 32, struct cmdp_monitor_test_batch)
+
+/* Configure after ATTACH and before the first scan. Both values are page
+ * ceilings in [1, 65536]; zero selects 64. A shared flush drains both groups
+ * when either ceiling, the bounded address window, or the time target ends.
+ * They are not the architecture's individual-invalidation threshold.
+ */
+#define CMDP_BATCH_DEFAULT 64U
+#define CMDP_BATCH_MAX 65536U
+struct cmdp_monitor_batch_config {
+	__u32 size, version, dirty_batch_pages, wp_batch_pages;
+	__u64 reserved[2];
+};
+struct cmdp_monitor_batch_status {
+	__u32 size, version, dirty_batch_pages, wp_batch_pages;
+	__u64 now_ns, hold_target_ns;
+	/* Actual shared calls/time: count each architectural flush exactly once.
+	 * Legacy dirty/ARM per-role counters can overlap for a shared flush.
+	 */
+	__u64 flush_calls, shared_flush_calls, dirty_only_flush_calls, wp_only_flush_calls;
+	__u64 flush_ns, dirty_pages, wp_pages;
+	__u64 max_dirty_pages, max_wp_pages, max_span_pages;
+	__u64 chunks, limit_chunks, time_chunks, max_hold_ns;
+	__u64 region_lookups, region_full_skips, region_skip_pages, active_run_skips;
+	__u64 history_regions, history_allocated_bytes, history_payload_bytes;
+	__u64 pmd_walks, pmd_cache_hits;
+};
+#define CMDP_MON_BATCH_CONFIG _IOW(CMDP_IOC_MAGIC, 33, struct cmdp_monitor_batch_config)
+#define CMDP_MON_BATCH_STATUS _IOWR(CMDP_IOC_MAGIC, 34, struct cmdp_monitor_batch_status)
 
 #endif /* _UAPI_LINUX_CMDP_H */

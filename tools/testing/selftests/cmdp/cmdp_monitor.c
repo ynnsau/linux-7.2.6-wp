@@ -130,6 +130,47 @@ static int diagnostics_read(int fd)
 	return 0;
 }
 
+static int batch_status_read(int fd)
+{
+	struct cmdp_monitor_batch_status d;
+	INIT_REQ(d);
+	if (ioctl(fd, CMDP_MON_BATCH_STATUS, &d)) {
+		if (errno == ENOTTY) return 0;
+		return -1;
+	}
+	flockfile(stdout);
+	printf("{\"event\":\"batch_status\",\"dirty_batch_pages\":%u,\"wp_batch_pages\":%u",
+	       d.dirty_batch_pages, d.wp_batch_pages);
+	printf(",\"now_ns\":%llu", d.now_ns);
+	printf(",\"hold_target_ns\":%llu", d.hold_target_ns);
+	printf(",\"flush_calls\":%llu", d.flush_calls);
+	printf(",\"shared_flush_calls\":%llu", d.shared_flush_calls);
+	printf(",\"dirty_only_flush_calls\":%llu", d.dirty_only_flush_calls);
+	printf(",\"wp_only_flush_calls\":%llu", d.wp_only_flush_calls);
+	printf(",\"flush_ns\":%llu", d.flush_ns);
+	printf(",\"dirty_pages\":%llu", d.dirty_pages);
+	printf(",\"wp_pages\":%llu", d.wp_pages);
+	printf(",\"max_dirty_pages\":%llu", d.max_dirty_pages);
+	printf(",\"max_wp_pages\":%llu", d.max_wp_pages);
+	printf(",\"max_span_pages\":%llu", d.max_span_pages);
+	printf(",\"chunks\":%llu", d.chunks);
+	printf(",\"limit_chunks\":%llu", d.limit_chunks);
+	printf(",\"time_chunks\":%llu", d.time_chunks);
+	printf(",\"max_hold_ns\":%llu", d.max_hold_ns);
+	printf(",\"region_lookups\":%llu", d.region_lookups);
+	printf(",\"region_full_skips\":%llu", d.region_full_skips);
+	printf(",\"region_skip_pages\":%llu", d.region_skip_pages);
+	printf(",\"active_run_skips\":%llu", d.active_run_skips);
+	printf(",\"history_regions\":%llu", d.history_regions);
+	printf(",\"history_allocated_bytes\":%llu", d.history_allocated_bytes);
+	printf(",\"history_payload_bytes\":%llu", d.history_payload_bytes);
+	printf(",\"pmd_walks\":%llu", d.pmd_walks);
+	printf(",\"pmd_cache_hits\":%llu", d.pmd_cache_hits);
+	puts("}");
+	funlockfile(stdout);
+	return 0;
+}
+
 static int dirty_status_read(int fd)
 {
 	struct cmdp_monitor_dirty_status d;
@@ -178,7 +219,7 @@ static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 		printf("%s\"%s\":%llu", i ? "," : "", reason(i), s->terminals[i]);
 	puts("}}");
 	funlockfile(stdout);
-	if (dirty_status_read(fd))
+	if (batch_status_read(fd) || dirty_status_read(fd))
 		return -1;
 	return diagnostics_read(fd);
 }
@@ -349,6 +390,8 @@ static void usage(const char *name)
 		"  --quiet-ms N      required quiet interval (default 10000, minimum 10)\n"
 		"  --max-pages N     active-page bound (default 8388608)\n"
 		"  --max-history N   address-history bound (default 8388608)\n"
+		"  --dirty-batch-pages N  dirty reset ceiling, 1..65536 (default 64)\n"
+		"  --wp-batch-pages N     ARM ceiling, 1..65536 (default 64)\n"
 		"  --poll-ms N       reporting interval (default 1000)\n"
 		"JSONL goes to stdout; launched target stdout/stderr goes to stderr.\n"
 		"Launch disables THP before exec. Attach never changes target policy.\n"
@@ -365,6 +408,8 @@ int main(int argc, char **argv)
 		{ "dirty-observe", 0, 0, 'o' }, { "dirty-qualify", 0, 0, 'q' },
 		{ "monitor-off", 0, 0, 'b' },
 		{ "quiet-ms", 1, 0, 'Q' },
+		{ "dirty-batch-pages", 1, 0, 'D' },
+		{ "wp-batch-pages", 1, 0, 'W' },
 		{ "poll-ms", 1, 0, 'P' }, { "help", 0, 0, 'h' }, { 0 }
 	};
 	struct cmdp_monitor_attach a;
@@ -377,11 +422,15 @@ int main(int argc, char **argv)
 	pid_t pid = 0;
 	int fd = -1, pidfd = -1, result = 1, opt, poll_ms = 1000;
 	bool own = false, once = false, attached = false, quiet_set = false;
-	bool monitor_off = false, measuring = false;
+	bool monitor_off = false, measuring = false, batch_set = false;
 	pthread_t measure_thread;
 	struct target_measurement measurement = { 0 };
 	struct cmdp_monitor_dirty_config dirty_config;
 	INIT_REQ(dirty_config);
+	struct cmdp_monitor_batch_config batch_config;
+	INIT_REQ(batch_config);
+	batch_config.dirty_batch_pages = CMDP_BATCH_DEFAULT;
+	batch_config.wp_batch_pages = CMDP_BATCH_DEFAULT;
 	while ((opt = getopt_long(argc, argv, "+", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'p': pid = (pid_t)number(optarg, INT_MAX); break;
@@ -396,6 +445,8 @@ int main(int argc, char **argv)
 			if (dirty_mode) { fprintf(stderr, "choose one dirty mode\n"); return 2; }
 			dirty_mode = opt == 'o' ? CMDP_MON_DIRTY_OBSERVE : CMDP_MON_DIRTY_QUALIFY;
 			break;
+		case 'D': batch_config.dirty_batch_pages = number(optarg, CMDP_BATCH_MAX); batch_set = true; break;
+		case 'W': batch_config.wp_batch_pages = number(optarg, CMDP_BATCH_MAX); batch_set = true; break;
 		case 'Q': dirty_config.quiet_ms = number(optarg, UINT32_MAX); quiet_set = true; break;
 		case 'm': a.max_pages = number(optarg, UINT32_MAX); break;
 		case 'H': a.max_history = number(optarg, UINT32_MAX); break;
@@ -405,7 +456,8 @@ int main(int argc, char **argv)
 		}
 	}
 	if (!poll_ms || (pid && optind != argc) || (!pid && optind == argc) ||
-	    (monitor_off && (pid || dirty_mode || quiet_set || a.flags || once || limit || seconds)) ||
+	    (!batch_config.dirty_batch_pages || !batch_config.wp_batch_pages) ||
+	    (monitor_off && (pid || dirty_mode || quiet_set || batch_set || a.flags || once || limit || seconds)) ||
 	    (dirty_mode && (a.flags & CMDP_MONITOR_F_SCAN_ONLY)) ||
 	    (quiet_set && (!dirty_mode || dirty_config.quiet_ms < 10))) {
 		usage(argv[0]); return 2;
@@ -432,6 +484,10 @@ int main(int argc, char **argv)
 		a.pidfd = pidfd;
 		if (ioctl(fd, CMDP_MON_ATTACH, &a)) { perror("CMDP_MON_ATTACH"); goto out; }
 		attached = true;
+		if (ioctl(fd, CMDP_MON_BATCH_CONFIG, &batch_config) &&
+		    (errno != ENOTTY || batch_set)) {
+			perror("CMDP_MON_BATCH_CONFIG"); goto out;
+		}
 		if (dirty_mode) {
 			dirty_config.mode = dirty_mode;
 			if (ioctl(fd, CMDP_MON_DIRTY_CONFIG, &dirty_config)) { perror("CMDP_MON_DIRTY_CONFIG"); goto out; }
