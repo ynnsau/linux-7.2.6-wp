@@ -101,6 +101,14 @@ if suite=='fused':
             int(x['allocated'])>=int(x['payload'])>0 for x in metrics), 'Invalid fused flush measurements')
     require(all(int(x['shared'])>0 for x in metrics if min(int(x['dirty']),int(x['wp']))>1),
             'Missing mixed dirty/ARM shared flush evidence')
+    writer_cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_MIXED_WRITERS ')]
+    require(len(writer_cases)==1 and writer_cases[0].get('resumed')=='4' and
+            int(writer_cases[0].get('wp',0))>=64 and int(writer_cases[0].get('shared',0))>0,
+            'Missing concurrent four-writer shared-flush proof')
+    allocation=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_ALLOCATION_BOUND ')]
+    require(len(allocation)==1 and int(allocation[0]['history'])<=256 and
+            int(allocation[0]['allocated'])<=41984 and int(allocation[0]['resources'])>0,
+            'Missing bounded history-allocation evidence')
 elif suite=='batch':
     require(not blocks and len(taps)==1 and taps[0]['planned']>=250, 'Missing batch fixture TAP checks')
     cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_BATCH_CASE ')]

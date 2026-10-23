@@ -141,6 +141,61 @@ static void mixed_window(bool abort, bool stop)
     CHECK(command(1) && command(2), "mixed flush, abort and STOP preserve target contents");
     finish();
 }
+static void mixed_writers(void)
+{
+    start(129, 4, CMDP_MON_DIRTY_QUALIFY, 32768); configure(64, 64);
+    CHECK(scan(), "prime concurrent shared-flush fixture"); usleep((Q_MS + 30) * 1000);
+    CHECK(command(3), "alternate pages need dirty reset before concurrent ARM");
+    injection(CMDP_MON_TEST_BATCH_ARM, 0);
+    CHECK(!ioctl(fd, CMDP_MON_START) && wait_phase(CMDP_MON_TEST_BATCH_ARM),
+          "shared dirty/ARM batch reaches its pre-flush pause");
+    struct cmdp_monitor_dirty_page d;
+    struct cmdp_monitor_page p;
+    CHECK(dirty_page(0, &d) && !d.valid && query(1, &p) && p.state != CMDP_MON_PAGE_ARMED,
+          "both pending sets remain unpublished before concurrent writers");
+    atomic_store(&ctl->hot, 1);
+    uint64_t until = now_ns() + UINT64_C(3000000000);
+    bool ran = false;
+    while (now_ns() < until) {
+        ran = true;
+        for (unsigned int i = 0; i < 4; i++) ran &= atomic_load(&ctl->iterations[i]) > 2;
+        if (ran) break;
+        usleep(100);
+    }
+    CHECK(ran, "all four CPU writers resume through the shared flush and WP handling");
+    atomic_store(&ctl->hot, 0);
+    CHECK(!ioctl(fd, CMDP_MON_STOP) && command(2) && balanced(),
+          "concurrent shared-flush writers retain data and drain cleanly");
+    struct cmdp_monitor_status st; INIT(st);
+    CHECK(!ioctl(fd, CMDP_MON_STATUS, &st) && st.terminals[CMDP_MON_WRITE] >= 64,
+          "writers actually revoke the protected odd fixture pages");
+    struct cmdp_monitor_batch_status b = batch_status();
+    CHECK(b.shared_flush_calls > 0, "concurrent writer case actually uses shared shootdowns");
+    printf("CMDP_FUSED_MIXED_WRITERS threads=4 resumed=4 wp=%llu shared=%llu\n",
+           st.terminals[CMDP_MON_WRITE], b.shared_flush_calls);
+    finish();
+}
+
+static void allocation_bound(void)
+{
+    start(2049, 1, CMDP_MON_DIRTY_OBSERVE, 32768);
+    close(fd);
+    fd = open(CMDP_MONITOR_DEVICE, O_RDWR | O_CLOEXEC);
+    struct cmdp_monitor_attach a; INIT(a);
+    a.pidfd = pidfd; a.max_pages = 32768; a.max_history = 256;
+    CHECK(fd >= 0 && !ioctl(fd, CMDP_MON_ATTACH, &a), "attach small reserved-history budget");
+    struct cmdp_monitor_dirty_config d; INIT(d); d.mode = CMDP_MON_DIRTY_OBSERVE; d.quiet_ms = Q_MS;
+    CHECK(!ioctl(fd, CMDP_MON_DIRTY_CONFIG, &d) && scan(), "sample with partial blocks in separate regions");
+    struct cmdp_monitor_status st; INIT(st);
+    struct cmdp_monitor_batch_status b = batch_status();
+    CHECK(!ioctl(fd, CMDP_MON_STATUS, &st) && st.history_entries <= 256 && st.resource_failures &&
+          b.history_allocated_bytes <= 256 * 160 + 2 * 512 && !st.active,
+          "reserved history slots bound sparse allocation and fail closed on exhaustion");
+    printf("CMDP_FUSED_ALLOCATION_BOUND history=%llu allocated=%llu resources=%llu\n",
+           st.history_entries, b.history_allocated_bytes, st.resource_failures);
+    finish();
+}
+
 static void validation(void)
 {
     start(1, 1, CMDP_MON_DIRTY_OBSERVE, 32768);
@@ -172,7 +227,7 @@ int main(void)
     for (unsigned int t = 1; t <= 4; t += 3)
         for (unsigned int i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
             limits(cases[i][0], cases[i][1], cases[i][2], t);
-    regions(); mixed_window(false, false); mixed_window(true, false); mixed_window(false, true);
+    regions(); allocation_bound(); mixed_writers(); mixed_window(false, false); mixed_window(true, false); mixed_window(false, true);
     CHECK(balanced(), "final shared-flush ownership is zero");
     printf("1..%d\n", checks); return 0;
 }
