@@ -95,3 +95,18 @@ campaign). They verify the installation/build receipts and inherit the exact
 outer runtime/RSS executor. The prepare base can also be the campaign base and
 `--prior`; use a new base for each cap pair. Do not use the old 144-run batching
 wrapper for this BFS-only three-repeat campaign.
+
+## Design goal and batch-size sweep
+
+Prioritize low end-to-end overhead while keeping substantial ARM coverage.
+Coverage is a secondary objective; do not impose a fixed 95% retention target.
+Report coverage in GiB and relative to RSS, and flag a large collapse before
+recommending a default. This is the user's continuing design goal (2026-10-23).
+
+The two-stage `scripts/run-fused-batch-sweep.py` keeps independent dirty/ARM
+controls: first equal limits from 64 to 65536, then three equal/asymmetric pairs
+with the same maximum address window. It uses 90 + 54 measured runs, three
+repetitions per cell/mode, and the existing timing/validation executor. The
+single-pair helper above remains available; the sweep uses a fresh common base
+with separate cap/stage/run directories and receipts. See
+[the frozen sweep protocol](../../../../wp_doc/batch-sweep-20261023.md).
