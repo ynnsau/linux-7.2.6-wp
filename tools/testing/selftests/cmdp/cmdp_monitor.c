@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -305,14 +306,47 @@ static void *report_while_stopping(void *arg)
 	}
 	return NULL;
 }
-static pid_t launch(char **argv)
+/* Explicit CPU IDs only; reject malformed masks instead of silently clipping. */
+static bool parse_target_cpus(const char *text, cpu_set_t *mask)
+{
+	const char *p = text;
+	char *end;
+	unsigned long cpu;
+
+	CPU_ZERO(mask);
+	do {
+		if (*p < '0' || *p > '9')
+			return false;
+		errno = 0;
+		cpu = strtoul(p, &end, 10);
+		if (errno || cpu >= CPU_SETSIZE || (*end && *end != ','))
+			return false;
+		CPU_SET(cpu, mask);
+		if (!*end)
+			return true;
+		p = end + 1;
+	} while (*p);
+	return false;
+}
+
+static pid_t launch(char **argv, const cpu_set_t *target_cpus)
 {
 	int pipefd[2], child_errno = 0;
 	if (pipe2(pipefd, O_CLOEXEC))
 		return -1;
 	pid_t pid = fork();
 	if (!pid) {
+		cpu_set_t effective;
 		close(pipefd[0]);
+		if (target_cpus) {
+			if (sched_setaffinity(0, sizeof(*target_cpus), target_cpus) ||
+			    sched_getaffinity(0, sizeof(effective), &effective))
+				goto child_error;
+			if (!CPU_EQUAL(target_cpus, &effective)) {
+				errno = EINVAL;
+				goto child_error;
+			}
+		}
 		/* Keep JSON stdout separate from unmodified target output. */
 		if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0 ||
 		    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0))
@@ -385,6 +419,7 @@ static void usage(const char *name)
 		"  --once            one synchronous sweep, then stop\n"
 		"  --inventory       scan-only session; do not ARM\n"
 		"  --monitor-off     launch/measure only; never open or attach CMD-P\n"
+		"  --target-cpus LIST  comma-separated CPU IDs, set in launched child before exec\n"
 		"  --dirty-observe   sample hardware dirty bits; never ARM\n"
 		"  --dirty-qualify   ARM only after a valid quiet interval\n"
 		"  --quiet-ms N      required quiet interval (default 10000, minimum 10)\n"
@@ -407,6 +442,7 @@ int main(int argc, char **argv)
 		{ "max-pages", 1, 0, 'm' }, { "max-history", 1, 0, 'H' },
 		{ "dirty-observe", 0, 0, 'o' }, { "dirty-qualify", 0, 0, 'q' },
 		{ "monitor-off", 0, 0, 'b' },
+		{ "target-cpus", 1, 0, 'C' },
 		{ "quiet-ms", 1, 0, 'Q' },
 		{ "dirty-batch-pages", 1, 0, 'D' },
 		{ "wp-batch-pages", 1, 0, 'W' },
@@ -423,6 +459,8 @@ int main(int argc, char **argv)
 	int fd = -1, pidfd = -1, result = 1, opt, poll_ms = 1000;
 	bool own = false, once = false, attached = false, quiet_set = false;
 	bool monitor_off = false, measuring = false, batch_set = false;
+	bool target_cpus_set = false;
+	cpu_set_t target_cpus;
 	pthread_t measure_thread;
 	struct target_measurement measurement = { 0 };
 	struct cmdp_monitor_dirty_config dirty_config;
@@ -440,6 +478,13 @@ int main(int argc, char **argv)
 		case '1': once = true; break;
 		case 's': a.flags |= CMDP_MONITOR_F_SCAN_ONLY; break;
 		case 'b': monitor_off = true; break;
+		case 'C':
+			if (target_cpus_set || !parse_target_cpus(optarg, &target_cpus)) {
+				fprintf(stderr, "invalid or repeated --target-cpus\n");
+				return 2;
+			}
+			target_cpus_set = true;
+			break;
 		case 'o':
 		case 'q':
 			if (dirty_mode) { fprintf(stderr, "choose one dirty mode\n"); return 2; }
@@ -455,7 +500,7 @@ int main(int argc, char **argv)
 		default: usage(argv[0]); return 2;
 		}
 	}
-	if (!poll_ms || (pid && optind != argc) || (!pid && optind == argc) ||
+	if (!poll_ms || (pid && (optind != argc || target_cpus_set)) || (!pid && optind == argc) ||
 	    (!batch_config.dirty_batch_pages || !batch_config.wp_batch_pages) ||
 	    (monitor_off && (pid || dirty_mode || quiet_set || batch_set || a.flags || once || limit || seconds)) ||
 	    (dirty_mode && (a.flags & CMDP_MONITOR_F_SCAN_ONLY)) ||
@@ -473,7 +518,7 @@ int main(int argc, char **argv)
 	}
 	if (!pid) {
 		launch_ns = now_ns();
-		pid = launch(&argv[optind]);
+		pid = launch(&argv[optind], target_cpus_set ? &target_cpus : NULL);
 		if (pid < 0) { perror("launch target"); goto out; }
 		exec_ack_ns = now_ns();
 		own = true;
