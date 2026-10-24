@@ -42,9 +42,9 @@ def collector_commands(stage, path, scanner):
                 '-e', 'sched:sched_wakeup_new', '-e', 'mmap_lock:*', '--filter', 'write == 1'] + context
         return [('record', common + args)]
     if stage == 'P2':
-        # Exclude idle tasks: CPU attribution needs active work, and idle
-        # software-clock interrupts can throttle while the scheduler tick stops.
-        return [('record', common + ['-e', 'cpu-clock/period=10101010,call-graph=fp/I'] + context)]
+        # Hardware PMU sampling uses NMIs on this x86 host, avoiding timer
+        # deferral through IRQ-disabled sections. Weights are cycles, not time.
+        return [('record', common + ['-e', 'cycles/freq=99,call-graph=fp/'] + context)]
     assert stage == 'P3'
     return [('record', common + context + ['-e', 'tlb:tlb_flush', '--filter', 'reason != 0']),
             ('stat', ['taskset', '-c', '24,25', PERF, 'stat', '-a', '-A', '-I', '1000',
@@ -88,7 +88,7 @@ class Campaign(fused.Campaign):
         frozen = fused.plan(json.loads((self.a.reference / 'frozen-work.json').read_text()), 512, 512)
         frozen.update(stages=list(self.a.stages), measured_runs=18 * len(self.a.stages), collection_cpu_affinity=[24,25],
             mmap_capture='write-lock events only; read-side blocking from scheduler stacks',
-            perf_clock='CLOCK_MONOTONIC; native lifecycle boundaries', cpu_sample_period_ns=10101010, cpu_sample_exclude_idle=True, collector_ready='all expected event FDs plus data mmap setup and 1s settle',
+            perf_clock='CLOCK_MONOTONIC; native lifecycle boundaries', cpu_sample_event='cycles', cpu_sample_frequency_hz=99, cpu_sample_weight_unit='cycles', collector_ready='all expected event FDs plus data mmap setup and 1s settle',
             perf=PERF, perf_sha256=matched.sha(Path(PERF)), vmlinux=VMLINUX,
             vmlinux_sha256=matched.sha(Path(VMLINUX)), scanner_symbol=self.scanner,
             exact_target_timer_unchanged=True, reused_tools_from=str(self.a.prior),
@@ -113,6 +113,23 @@ class Campaign(fused.Campaign):
                 self.reference_sources['bfs-t' + str(threads)] = json.loads(receipt.read_text())['sources']
             frozen['unprofiled_reference'] = str(ref)
             frozen['unprofiled_receipt_sha256'] = {str(p.relative_to(ref)): matched.sha(p) for p in refs}
+        if self.a.scheduling_reference:
+            ref = self.a.scheduling_reference
+            original = json.loads((ref / 'provenance.json').read_text())
+            for key in ('kernel_commit', 'running_build_id', 'graph_sha256', 'gapbs_commit', 'binary_sha256', 'monitor_sha256'):
+                assert original[key] == current[key], key
+            refs = sorted((ref / 'measured/P1').glob('*/summary.json'))
+            assert len(refs) == 18
+            for receipt in refs:
+                result = json.loads(receipt.read_text())
+                assert result['pass'] and result['boot_id'] == self.before['boot_id']
+                assert result['sources'] == self.reference_sources['bfs-t' + str(result['threads'])]
+                for name, digest in result['evidence_sha256'].items():
+                    assert matched.sha(receipt.parent / name) == digest
+                quality = json.loads((ref / 'quality' / ('P1-' + receipt.parent.name + '.json')).read_text())
+                assert quality['pass_']
+            frozen['scheduling_reference'] = str(ref)
+            frozen['scheduling_receipt_sha256'] = {str(p.relative_to(ref)): matched.sha(p) for p in refs}
         target = self.base / 'profile-plan.json'
         if target.exists():
             assert json.loads(target.read_text()) == frozen
@@ -253,6 +270,7 @@ def main():
     parser.add_argument('--stages', nargs='+', choices=STAGES, default=list(STAGES))
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--unprofiled-reference', type=Path)
+    parser.add_argument('--scheduling-reference', type=Path)
     a = parser.parse_args()
     if 'P0' not in a.stages and not a.unprofiled_reference:
         parser.error('A completed --unprofiled-reference is required when omitting P0')

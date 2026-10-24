@@ -55,9 +55,26 @@ exact boundaries in each recording. Do not compare different perf clock epochs.
 
 P2 samples active CPU work every 10,101,010 ns (approximately 99 Hz) with frame
 pointer call chains. The event excludes idle tasks (`/I`): idle software-clock
-interrupts produced throttling in the short validation fixture while the
-scheduler tick was stopped. The measured kernel's hrtimer callback checks
+interrupts produced throttling in the short validation fixture, consistent
+with the idle scheduler-tick behavior. The measured kernel's hrtimer callback checks
 exclude_idle before accounting a sample. No global perf throttling or tick
 policy is changed. Keep context tracepoints at their default period of one;
 do not apply a global sample frequency to them. Verify complete scanner work
 markers and zero lost/throttled samples before the full campaign.
+
+## Retained hardware-cycle profiles
+
+The three initial P2 CPU-clock profiles are diagnostic pilots. Many scanner
+samples landed at `_raw_spin_unlock_irqrestore`; timer interrupts can be
+deferred until interrupts are restored, so this is not evidence that the
+unlock instruction itself consumes that time or that a lock is contended.
+The CPU-clock hrtimer path and the x86 PMU NMI path differ in this respect.
+
+Retain P0 from v1 and all 18 P1 profiles from v3. Collect P2/P3 in v4 after
+validating those source/kernel/tool identities and every reused receipt. P2
+uses `cycles/freq=99,call-graph=fp/` with context tracepoints still at period
+one. Report sampled cycles and cycle shares, not seconds. Hardware sampling
+can still skid, so function rankings are approximate; scheduler traces remain
+the direct source for on-CPU/runnable/blocked time. The short P2/P3 fixture
+checks complete work-item boundaries, clocks and zero loss/throttling. No
+kernel, tick, affinity or NUMA-policy change is involved.
