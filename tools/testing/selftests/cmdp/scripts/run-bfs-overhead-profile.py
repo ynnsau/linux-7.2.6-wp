@@ -39,7 +39,7 @@ def collector_commands(stage, path, scanner):
         return []
     if stage == 'P1':
         args = ['-e', 'sched:sched_switch/call-graph=fp/', '-e', 'sched:sched_wakeup',
-                '-e', 'sched:sched_wakeup_new', '-e', 'mmap_lock:*'] + context
+                '-e', 'sched:sched_wakeup_new', '-e', 'mmap_lock:*', '--filter', 'write == 1'] + context
         return [('record', common + args)]
     if stage == 'P2':
         return [('record', common + ['-F', '99', '-e', 'cpu-clock/call-graph=fp/'] + context)]
@@ -51,7 +51,7 @@ def collector_commands(stage, path, scanner):
 
 class Campaign(fused.Campaign):
     def __init__(self, a):
-        self.profile_stage = 'P0'
+        self.profile_stage = a.stages[0]
         self.collectors = []
         self.collector_records = []
         super().__init__(a)
@@ -59,7 +59,7 @@ class Campaign(fused.Campaign):
     def state(self, stage, **extra):
         extra.update(profile_stage=self.profile_stage,
                      measured_completed=sum(k.startswith('measured/') for k in self.summaries),
-                     measured_total=72)
+                     measured_total=18 * len(self.a.stages))
         super().state(stage, **extra)
 
     def preflight(self):
@@ -84,13 +84,32 @@ class Campaign(fused.Campaign):
             else:
                 shutil.copyfile(str(p), str(dest))
         frozen = fused.plan(json.loads((self.a.reference / 'frozen-work.json').read_text()), 512, 512)
-        frozen.update(stages=list(STAGES), measured_runs=72, collection_cpu_affinity=[24,25],
+        frozen.update(stages=list(self.a.stages), measured_runs=18 * len(self.a.stages), collection_cpu_affinity=[24,25],
+            mmap_capture='write-lock events only; read-side blocking from scheduler stacks',
             perf=PERF, perf_sha256=matched.sha(Path(PERF)), vmlinux=VMLINUX,
             vmlinux_sha256=matched.sha(Path(VMLINUX)), scanner_symbol=self.scanner,
             exact_target_timer_unchanged=True, reused_tools_from=str(self.a.prior),
             pmu_scope='system-wide per CPU, 1s intervals; includes scanner and background activity',
             pmu_group=PMU, policy_changes=False,
             startup_shutdown_outside_timer=True, no_kernel_changes=True)
+        self.reference_sources = {}
+        if self.a.unprofiled_reference:
+            ref = self.a.unprofiled_reference
+            original = json.loads((ref / 'provenance.json').read_text())
+            for key in ('kernel_commit', 'running_build_id', 'graph_sha256', 'gapbs_commit', 'binary_sha256', 'monitor_sha256'):
+                assert original[key] == current[key], key
+            refs = sorted((ref / 'measured/P0').glob('*/summary.json'))
+            assert len(refs) == 18
+            for receipt in refs:
+                result = json.loads(receipt.read_text())
+                assert result['pass'] and result['boot_id'] == self.before['boot_id']
+                for name, digest in result['evidence_sha256'].items():
+                    assert matched.sha(receipt.parent / name) == digest
+            for threads in (1, 4):
+                receipt = ref / ('measured/P0/b01-bfs-t{}-A/summary.json'.format(threads))
+                self.reference_sources['bfs-t' + str(threads)] = json.loads(receipt.read_text())['sources']
+            frozen['unprofiled_reference'] = str(ref)
+            frozen['unprofiled_receipt_sha256'] = {str(p.relative_to(ref)): matched.sha(p) for p in refs}
         target = self.base / 'profile-plan.json'
         if target.exists():
             assert json.loads(target.read_text()) == frozen
@@ -187,7 +206,7 @@ class Campaign(fused.Campaign):
 
     def run(self):
         self.preflight()
-        reference = {}
+        reference = dict(self.reference_sources)
         for stage in self.a.stages:
             self.profile_stage = stage
             for entry in self.plan['schedule']:
@@ -217,7 +236,10 @@ def main():
     parser.add_argument('--reference', type=Path, default=Path('/home/yans3/cmdp-v2/periodic/matched-gapbs-20261022-v1'))
     parser.add_argument('--stages', nargs='+', choices=STAGES, default=list(STAGES))
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--unprofiled-reference', type=Path)
     a = parser.parse_args()
+    if 'P0' not in a.stages and not a.unprofiled_reference:
+        parser.error('A completed --unprofiled-reference is required when omitting P0')
     a.dirty_batch_pages = a.wp_batch_pages = 512
     record = json.loads(fused.BUILD_RECORD.read_text())
     matched.KERNEL_COMMIT = record['source_freezes']['fixed']['commit']
