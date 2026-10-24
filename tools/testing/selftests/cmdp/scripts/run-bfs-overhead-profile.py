@@ -34,7 +34,7 @@ def collector_commands(stage, path, scanner):
     for event in ('workqueue_execute_start', 'workqueue_execute_end'):
         context += ['-e', 'workqueue:' + event, '--filter', 'function == ' + scanner]
     context += ['-e', 'cmdp:cmdp_invalidation']
-    common = ['taskset', '-c', '24,25', PERF, 'record', '-a', '-m', '1024', '-o', str(path / 'perf.data')]
+    common = ['taskset', '-c', '24,25', PERF, 'record', '-a', '--clockid', 'mono', '-m', '1024', '-o', str(path / 'perf.data')]
     if stage == 'P0':
         return []
     if stage == 'P1':
@@ -42,7 +42,9 @@ def collector_commands(stage, path, scanner):
                 '-e', 'sched:sched_wakeup_new', '-e', 'mmap_lock:*', '--filter', 'write == 1'] + context
         return [('record', common + args)]
     if stage == 'P2':
-        return [('record', common + ['-F', '99', '-e', 'cpu-clock/call-graph=fp/'] + context)]
+        # Exclude idle tasks: CPU attribution needs active work, and idle
+        # software-clock interrupts can throttle while the scheduler tick stops.
+        return [('record', common + ['-e', 'cpu-clock/period=10101010,call-graph=fp/I'] + context)]
     assert stage == 'P3'
     return [('record', common + context + ['-e', 'tlb:tlb_flush', '--filter', 'reason != 0']),
             ('stat', ['taskset', '-c', '24,25', PERF, 'stat', '-a', '-A', '-I', '1000',
@@ -86,6 +88,7 @@ class Campaign(fused.Campaign):
         frozen = fused.plan(json.loads((self.a.reference / 'frozen-work.json').read_text()), 512, 512)
         frozen.update(stages=list(self.a.stages), measured_runs=18 * len(self.a.stages), collection_cpu_affinity=[24,25],
             mmap_capture='write-lock events only; read-side blocking from scheduler stacks',
+            perf_clock='CLOCK_MONOTONIC; native lifecycle boundaries', cpu_sample_period_ns=10101010, cpu_sample_exclude_idle=True, collector_ready='all expected event FDs plus data mmap setup and 1s settle',
             perf=PERF, perf_sha256=matched.sha(Path(PERF)), vmlinux=VMLINUX,
             vmlinux_sha256=matched.sha(Path(VMLINUX)), scanner_symbol=self.scanner,
             exact_target_timer_unchanged=True, reused_tools_from=str(self.a.prior),
@@ -120,6 +123,8 @@ class Campaign(fused.Campaign):
     def start_collectors(self, path):
         self.collectors = []
         self.collector_records = []
+        online = Path('/sys/devices/system/cpu/online').read_text().strip().split(',')
+        online_count = sum(int(x.split('-')[-1])-int(x.split('-')[0])+1 for x in online)
         for name, argv in collector_commands(self.profile_stage, path, self.scanner):
             log = (path / (name + '.log')).open('w')
             start = matched.ns()
@@ -134,7 +139,7 @@ class Campaign(fused.Campaign):
             while True:
                 assert all(p.poll() is None for _, p, _ in self.collectors), 'Collector failed at startup'
                 ready = True
-                for _, p, _ in self.collectors:
+                for collector_name, p, collector_log in self.collectors:
                     fds = list((Path('/proc') / str(p.pid) / 'fd').iterdir())
                     targets = []
                     for fd in fds:
@@ -142,12 +147,23 @@ class Campaign(fused.Campaign):
                             targets.append(os.readlink(str(fd)))
                         except FileNotFoundError:
                             pass  # perf closes transient files during startup
-                    ready &= any('perf_event' in target for target in targets)
+                    expected_events = (9 if self.profile_stage == 'P1' else 4) if collector_name == 'record' else 5
+                    expected_fds = expected_events * online_count
+                    count_fds = sum('perf_event' in target for target in targets)
+                    ready &= count_fds >= expected_fds
+                    if collector_name == 'record':
+                        data_path = path / 'perf.data'
+                        ready &= data_path.exists() and data_path.stat().st_size > 0
+                    for record in self.collector_records:
+                        if record['name'] == collector_name:
+                            record.update(expected_perf_event_fds=expected_fds, observed_perf_event_fds=count_fds)
                 if ready:
                     break
                 assert time.monotonic() < deadline, 'Collector perf-event startup timed out'
                 time.sleep(.02)
-            time.sleep(.2)
+            time.sleep(1.0)
+            for record in self.collector_records:
+                record['ready_ns'] = matched.ns()
         matched.save(path / 'collectors.json', self.collector_records)
 
     def stop_collectors(self, path):

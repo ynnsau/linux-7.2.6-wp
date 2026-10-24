@@ -44,3 +44,20 @@ Continue P1--P3 in a separate evidence directory, with write == 1 on all mmap
 lock tracepoints. Scheduler switch stacks still identify read-lock blocking;
 per-page read-lock acquisitions are not recorded. Validate the 18 reference
 receipts plus kernel/binary/tool identity before linking the campaigns.
+
+## Collector readiness and clock validation
+
+Before launching the timed job, require all expected per-CPU event descriptors,
+a nonempty recording file, and one second of settling. Checking only the first
+perf descriptor missed an initial scanner-start marker in a discarded pilot.
+Use CLOCK_MONOTONIC timestamps and retain raw controller FORK/EXIT records for
+exact boundaries in each recording. Do not compare different perf clock epochs.
+
+P2 samples active CPU work every 10,101,010 ns (approximately 99 Hz) with frame
+pointer call chains. The event excludes idle tasks (`/I`): idle software-clock
+interrupts produced throttling in the short validation fixture while the
+scheduler tick was stopped. The measured kernel's hrtimer callback checks
+exclude_idle before accounting a sample. No global perf throttling or tick
+policy is changed. Keep context tracepoints at their default period of one;
+do not apply a global sample frequency to them. Verify complete scanner work
+markers and zero lost/throttled samples before the full campaign.
