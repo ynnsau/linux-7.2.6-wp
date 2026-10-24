@@ -96,3 +96,15 @@ Make this collector refinement only between completed blocks, with an
 eight-second fixture confirming complete scanner intervals, loss-free traces,
 clock boundaries, the filter and PMU running percentage before P3 begins.
 Preserve v4's deliberate boundary interruption and every completed receipt.
+
+## Observed automatic perf adjustment
+
+The completed campaign recorded automatic reductions of the global sampling
+ceiling from 63,750 to 20,250/s during hardware readiness and the first P2
+baseline. No manual sysctl change was made. All 18 retained P2 recordings
+preserve a requested 99-Hz hardware-cycle event and period-one context
+tracepoints, below every observed ceiling. Raw record audits found zero loss
+or throttling. The final ceiling remains under kernel control; it is recorded
+separately from unchanged NUMA/THP/placement/governor settings. Use P0 for
+headline runtime overhead, and preserve the adjustment as an instrumentation
+limitation. See [completed results](bfs-overhead-profile-results.md).
