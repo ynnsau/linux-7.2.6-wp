@@ -53,8 +53,9 @@ perf descriptor missed an initial scanner-start marker in a discarded pilot.
 Use CLOCK_MONOTONIC timestamps and retain raw controller FORK/EXIT records for
 exact boundaries in each recording. Do not compare different perf clock epochs.
 
-P2 samples active CPU work every 10,101,010 ns (approximately 99 Hz) with frame
-pointer call chains. The event excludes idle tasks (`/I`): idle software-clock
+The discarded CPU-clock P2 pilots sampled active work every 10,101,010 ns
+(approximately 99 Hz) with frame-pointer call chains. Those events excluded
+idle tasks (`/I`): idle software-clock
 interrupts produced throttling in the short validation fixture, consistent
 with the idle scheduler-tick behavior. The measured kernel's hrtimer callback checks
 exclude_idle before accounting a sample. No global perf throttling or tick
@@ -70,7 +71,7 @@ deferred until interrupts are restored, so this is not evidence that the
 unlock instruction itself consumes that time or that a lock is contended.
 The CPU-clock hrtimer path and the x86 PMU NMI path differ in this respect.
 
-Retain P0 from v1 and all 18 P1 profiles from v3. Collect P2/P3 in v4 after
+Retain P0 from v1 and all 18 P1 profiles from v3. Collect P2 in v4 after
 validating those source/kernel/tool identities and every reused receipt. P2
 uses `cycles/freq=99,call-graph=fp/` with context tracepoints still at period
 one. Report sampled cycles and cycle shares, not seconds. Hardware sampling
@@ -78,3 +79,20 @@ can still skid, so function rankings are approximate; scheduler traces remain
 the direct source for on-CPU/runnable/blocked time. The short P2/P3 fixture
 checks complete work-item boundaries, clocks and zero loss/throttling. No
 kernel, tick, affinity or NUMA-policy change is involved.
+
+## Actual task-switch TLB flushes
+
+Retain all 18 hardware P2 profiles from v4 and collect P3 in v5 after validating
+all P0/P1/P2 references. Use `reason != 0 || pages != 0` for `tlb:tlb_flush`.
+The matching `arch/x86/mm/tlb.c` emits reason 0 with pages -1 when a task switch
+actually flushes its context, and pages 0 when an existing ASID is reused
+without a flush. Lazy invalidation can defer work until such a switch. Keep
+actual switches and exclude no-op switches; counting only nonzero reasons
+would miss part of translation invalidation. Full-context events are not
+all-process/all-CPU flushes. Receiving-event context alone does not identify
+the initiating scanner. Hardware counters remain per CPU, not task-exclusive.
+
+Make this collector refinement only between completed blocks, with an
+eight-second fixture confirming complete scanner intervals, loss-free traces,
+clock boundaries, the filter and PMU running percentage before P3 begins.
+Preserve v4's deliberate boundary interruption and every completed receipt.
