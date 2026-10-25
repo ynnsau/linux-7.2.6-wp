@@ -4,6 +4,8 @@
 #include <linux/capability.h>
 #include <linux/cmdp.h>
 #include <linux/completion.h>
+#include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/init.h>
@@ -209,6 +211,8 @@ struct cmdp_monitor {
 	struct mutex scan;
 	spinlock_t lock;
 	struct delayed_work work;
+	struct work_struct cpu_stop_work;
+	struct hlist_node cpu_node;
 	struct cmdp_session *session;
 	struct xarray regions;
 	u64 history_slots;
@@ -218,6 +222,7 @@ struct cmdp_monitor {
 	struct cmdp_monitor_dirty_status dirty;
 	struct cmdp_monitor_diagnostics diagnostics;
 	struct cmdp_monitor_batch_status batch_status;
+	struct cmdp_monitor_cpu_status cpu_status;
 	struct cmdp_cohort *current_cohort;
 	u64 next_lifetime;
 	u64 account_ns;
@@ -229,6 +234,7 @@ struct cmdp_monitor {
 	struct cmdp_monitor_test_batch test_batch;
 #endif
 };
+static int cmdp_cpuhp_state;
 /* Blocks and regions are never removed until the notifier and worker have
  * drained. m->lock protects present/armed bits and the contents of histories.
  */
@@ -1438,17 +1444,24 @@ static void cmdp_monitor_account(struct cmdp_monitor *m, u64 now)
 	m->account_ns = now;
 }
 
-static void cmdp_monitor_mark_stop(struct cmdp_monitor *m, unsigned int reason)
+static void cmdp_monitor_mark_stop_locked(struct cmdp_monitor *m,
+		unsigned int reason)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(&m->lock, flags);
+	lockdep_assert_held(&m->lock);
 	if (m->status.state < CMDP_MON_STOPPING) {
 		m->status.state = CMDP_MON_STOPPING;
 		m->status.stop_reason = reason;
 		m->progress.stop_request_ns = ktime_get_ns();
 		m->progress.stop_request_active = m->status.active;
 	}
+}
+
+static void cmdp_monitor_mark_stop(struct cmdp_monitor *m, unsigned int reason)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->lock, flags);
+	cmdp_monitor_mark_stop_locked(m, reason);
 	spin_unlock_irqrestore(&m->lock, flags);
 }
 
@@ -2699,6 +2712,40 @@ next:
 	return ret;
 }
 
+/* ctl serializes START/self-requeue against STOP. For explicit placement the
+ * caller also holds cpus_read_lock, always BEFORE ctl, and never over a scan
+ * or a synchronous work join. A scan can itself call hotplug-sensitive code.
+ */
+static int cmdp_monitor_queue(struct cmdp_monitor *m, unsigned long delay)
+{
+	int cpu = m->cpu_status.cpu;
+	bool queued;
+
+	lockdep_assert_held(&m->ctl);
+	if (cpu == CMDP_MON_CPU_AUTO) {
+		queued = schedule_delayed_work(&m->work, delay);
+	} else {
+		lockdep_assert_cpus_held();
+		if (!cpu_online(cpu))
+			return -ENODEV;
+		queued = schedule_delayed_work_on(cpu, &m->work, delay);
+	}
+	return queued ? 0 : -EBUSY;
+}
+
+static void cmdp_monitor_cpu_error(struct cmdp_monitor *m, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->lock, flags);
+	if (!m->cpu_status.error)
+		m->cpu_status.error = error;
+	cmdp_monitor_mark_stop_locked(m, CMDP_MON_ERROR);
+	spin_unlock_irqrestore(&m->lock, flags);
+	/* Never join the scan from its own work function. */
+	queue_work(system_dfl_wq, &m->cpu_stop_work);
+}
+
 static void cmdp_monitor_work(struct work_struct *work)
 {
 	struct cmdp_monitor *m = container_of(to_delayed_work(work),
@@ -2706,13 +2753,23 @@ static void cmdp_monitor_work(struct work_struct *work)
 	unsigned long flags;
 	u64 now, period, missed = 0, delay = 0;
 	bool again = false;
-	int ret;
+	bool bound = READ_ONCE(m->cpu_status.cpu) != CMDP_MON_CPU_AUTO;
+	int ret, queue_ret = 0;
 
 	mutex_lock(&m->scan);
 	spin_lock_irqsave(&m->lock, flags);
 	if (m->status.state != CMDP_MON_RUNNING) {
 		spin_unlock_irqrestore(&m->lock, flags);
 		mutex_unlock(&m->scan);
+		return;
+	}
+	m->cpu_status.last_cpu = raw_smp_processor_id();
+	m->cpu_status.work_items++;
+	if (bound && m->cpu_status.last_cpu != m->cpu_status.cpu) {
+		m->cpu_status.wrong_cpu_work_items++;
+		spin_unlock_irqrestore(&m->lock, flags);
+		mutex_unlock(&m->scan);
+		cmdp_monitor_cpu_error(m, -EXDEV);
 		return;
 	}
 	m->scanning = true;
@@ -2738,10 +2795,16 @@ static void cmdp_monitor_work(struct work_struct *work)
 	mutex_unlock(&m->scan);
 	/* Queue under ctl so STOP cannot miss a racing self-requeue. */
 	if (again) {
+		if (bound)
+			cpus_read_lock();
 		mutex_lock(&m->ctl);
 		if (READ_ONCE(m->status.state) == CMDP_MON_RUNNING)
-			schedule_delayed_work(&m->work, nsecs_to_jiffies(delay));
+			queue_ret = cmdp_monitor_queue(m, nsecs_to_jiffies(delay));
 		mutex_unlock(&m->ctl);
+		if (bound)
+			cpus_read_unlock();
+		if (queue_ret)
+			cmdp_monitor_cpu_error(m, queue_ret);
 	}
 	/* STOP owns cleanup after joining us. Re-entering mmap_write_lock here
 	 * on cancellation would recreate the uninterruptible join dependency.
@@ -2777,6 +2840,43 @@ static void cmdp_monitor_stop(struct cmdp_monitor *m, unsigned int reason)
 		m->progress.stop_complete_ns = ktime_get_ns();
 	spin_unlock_irqrestore(&m->lock, flags);
 	mutex_unlock(&m->scan);
+}
+
+static void cmdp_monitor_cpu_stop_work(struct work_struct *work)
+{
+	struct cmdp_monitor *m = container_of(work, struct cmdp_monitor,
+					     cpu_stop_work);
+
+	cmdp_monitor_stop(m, CMDP_MON_ERROR);
+}
+
+static int cmdp_monitor_cpu_offline(unsigned int cpu, struct hlist_node *node)
+{
+	struct cmdp_monitor *m = container_of(node, struct cmdp_monitor, cpu_node);
+	unsigned long flags;
+	bool stop = false;
+
+	/* Hotplug's writer excludes initial queueing and self-requeue. Do not
+	 * take ctl, mmap, or join work here: a running scanner may be waiting
+	 * for the same hotplug operation (e.g. in lru_add_drain_all).
+	 */
+	spin_lock_irqsave(&m->lock, flags);
+	if (m->cpu_status.cpu == cpu && m->status.state == CMDP_MON_RUNNING) {
+		m->cpu_status.offline_events++;
+		m->cpu_status.error = -ENODEV;
+		cmdp_monitor_mark_stop_locked(m, CMDP_MON_ERROR);
+		stop = true;
+	}
+	spin_unlock_irqrestore(&m->lock, flags);
+	if (stop) {
+		/* Remove a CPU-pinned timer before it can be stranded offline.
+		 * Any running scan observes cancellation and flushes pending PTE
+		 * work; cleanup may finish elsewhere after the CPU goes offline.
+		 */
+		cancel_delayed_work(&m->work);
+		queue_work(system_dfl_wq, &m->cpu_stop_work);
+	}
+	return 0;
 }
 
 static int cmdp_monitor_attach_target(struct cmdp_monitor *m,
@@ -3118,6 +3218,8 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		struct cmdp_monitor_diagnostics diagnostics;
 		struct cmdp_monitor_batch_config batch_config;
 		struct cmdp_monitor_batch_status batch_status;
+		struct cmdp_monitor_cpu_config cpu_config;
+		struct cmdp_monitor_cpu_status cpu_status;
 		struct cmdp_monitor_page_snapshot snapshot;
 #ifdef CONFIG_CMDP_TEST
 		struct cmdp_monitor_test_batch test_batch;
@@ -3126,6 +3228,7 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 	struct cmdp_history *h;
 	struct cmdp_cohort *c;
 	unsigned long flags;
+	bool cpu_lock = cmd == CMDP_MON_START || cmd == CMDP_MON_CPU_CONFIG;
 	int ret = 0;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -3145,6 +3248,8 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		cmdp_monitor_stop(m, CMDP_MON_CONTROL_STOP);
 		return 0;
 	}
+	if (cpu_lock)
+		cpus_read_lock();
 	mutex_lock(&m->ctl);
 	switch (cmd) {
 #ifdef CONFIG_CMDP_TEST
@@ -3178,6 +3283,48 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 		ret = cmdp_monitor_attach_target(m, &data.a);
+		break;
+	case CMDP_MON_CPU_CONFIG:
+		if (copy_from_user(&data.cpu_config, up, sizeof(data.cpu_config))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (data.cpu_config.size != sizeof(data.cpu_config) ||
+		    data.cpu_config.version != CMDP_MONITOR_VERSION ||
+		    data.cpu_config.reserved || data.cpu_config.cpu < CMDP_MON_CPU_AUTO ||
+		    (data.cpu_config.cpu >= 0 &&
+		     (data.cpu_config.cpu >= nr_cpu_ids || !cpu_possible(data.cpu_config.cpu)))) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		if (!m->session || m->status.state != CMDP_MON_ATTACHED ||
+		    m->scanning || m->status.passes_started)
+			ret = -EBUSY;
+		else if (data.cpu_config.cpu >= 0 && !cpu_online(data.cpu_config.cpu))
+			ret = -ENODEV;
+		else
+			m->cpu_status.cpu = data.cpu_config.cpu;
+		spin_unlock_irqrestore(&m->lock, flags);
+		break;
+	case CMDP_MON_CPU_STATUS:
+		if (copy_from_user(&data.cpu_status, up, sizeof(data.cpu_status))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (data.cpu_status.size != sizeof(data.cpu_status) ||
+		    data.cpu_status.version != CMDP_MONITOR_VERSION) {
+			ret = -EINVAL;
+			break;
+		}
+		spin_lock_irqsave(&m->lock, flags);
+		data.cpu_status = m->cpu_status;
+		data.cpu_status.size = sizeof(data.cpu_status);
+		data.cpu_status.version = CMDP_MONITOR_VERSION;
+		data.cpu_status.now_ns = ktime_get_ns();
+		spin_unlock_irqrestore(&m->lock, flags);
+		if (copy_to_user(up, &data.cpu_status, sizeof(data.cpu_status)))
+			ret = -EFAULT;
 		break;
 	case CMDP_MON_BATCH_CONFIG:
 		if (copy_from_user(&data.batch_config, up, sizeof(data.batch_config))) {
@@ -3308,6 +3455,16 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case CMDP_MON_START:
 	case CMDP_MON_SCAN_ONCE:
+		if (m->cpu_status.cpu != CMDP_MON_CPU_AUTO) {
+			if (cmd == CMDP_MON_SCAN_ONCE) {
+				ret = -EOPNOTSUPP;
+				break;
+			}
+			if (!cpu_online(m->cpu_status.cpu)) {
+				ret = -ENODEV;
+				break;
+			}
+		}
 		spin_lock_irqsave(&m->lock, flags);
 		if (!m->session || m->status.state != CMDP_MON_ATTACHED || m->scanning) {
 			spin_unlock_irqrestore(&m->lock, flags);
@@ -3322,7 +3479,9 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		}
 		spin_unlock_irqrestore(&m->lock, flags);
 		if (cmd == CMDP_MON_START) {
-			schedule_delayed_work(&m->work, 0);
+			ret = cmdp_monitor_queue(m, 0);
+			if (ret)
+				cmdp_monitor_cpu_error(m, ret);
 			break;
 		}
 		/* STOP may mark cancellation while this ioctl performs its scan. */
@@ -3486,12 +3645,15 @@ static long cmdp_monitor_ioctl(struct file *file, unsigned int cmd,
 		ret = -ENOTTY;
 	}
 	mutex_unlock(&m->ctl);
+	if (cpu_lock)
+		cpus_read_unlock();
 	return ret;
 }
 
 static int cmdp_monitor_open(struct inode *inode, struct file *file)
 {
 	struct cmdp_monitor *m;
+	int ret;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -3506,7 +3668,15 @@ static int cmdp_monitor_open(struct inode *inode, struct file *file)
 	m->batch_status.dirty_batch_pages = CMDP_BATCH_DEFAULT;
 	m->batch_status.wp_batch_pages = CMDP_BATCH_DEFAULT;
 	m->batch_status.hold_target_ns = CMDP_MON_HOLD_NS;
+	m->cpu_status.cpu = CMDP_MON_CPU_AUTO;
+	m->cpu_status.last_cpu = CMDP_MON_CPU_AUTO;
 	INIT_DELAYED_WORK(&m->work, cmdp_monitor_work);
+	INIT_WORK(&m->cpu_stop_work, cmdp_monitor_cpu_stop_work);
+	ret = cpuhp_state_add_instance_nocalls(cmdp_cpuhp_state, &m->cpu_node);
+	if (ret) {
+		kfree(m);
+		return ret;
+	}
 	file->private_data = m;
 	return 0;
 }
@@ -3517,7 +3687,12 @@ static int cmdp_monitor_release(struct inode *inode, struct file *file)
 	void *entry;
 	unsigned long index;
 
+	/* Exclude callbacks first, join the scanner (which can enqueue cleanup),
+	 * then join cleanup. Nothing may retain m beyond these three barriers.
+	 */
+	cpuhp_state_remove_instance_nocalls(cmdp_cpuhp_state, &m->cpu_node);
 	cmdp_monitor_stop(m, CMDP_MON_CONTROL_STOP);
+	cancel_work_sync(&m->cpu_stop_work);
 	if (m->session) {
 		unsigned long flags;
 
@@ -3686,12 +3861,20 @@ static int __init cmdp_init(void)
 	struct dentry *dir = debugfs_create_dir("cmdp", NULL);
 	int ret;
 
-	ret = misc_register(&cmdp_misc_device);
-	if (ret)
+	ret = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN, "mm/cmdp:online",
+				     NULL, cmdp_monitor_cpu_offline);
+	if (ret < 0)
 		return ret;
+	cmdp_cpuhp_state = ret;
+	ret = misc_register(&cmdp_misc_device);
+	if (ret) {
+		cpuhp_remove_multi_state(cmdp_cpuhp_state);
+		return ret;
+	}
 	ret = misc_register(&cmdp_monitor_device);
 	if (ret) {
 		misc_deregister(&cmdp_misc_device);
+		cpuhp_remove_multi_state(cmdp_cpuhp_state);
 		return ret;
 	}
 	debugfs_create_file("control", 0600, dir, NULL, &cmdp_control_fops);

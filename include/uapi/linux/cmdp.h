@@ -321,4 +321,29 @@ struct cmdp_monitor_batch_status {
 #define CMDP_MON_BATCH_CONFIG _IOW(CMDP_IOC_MAGIC, 33, struct cmdp_monitor_batch_config)
 #define CMDP_MON_BATCH_STATUS _IOWR(CMDP_IOC_MAGIC, 34, struct cmdp_monitor_batch_status)
 
+/* Per-session placement of periodic work. Configure after ATTACH, before any
+ * scan; immutable thereafter. AUTO preserves the legacy queueing policy.
+ * An explicit CPU must be possible and online. SCAN_ONCE is synchronous in
+ * the caller and is rejected with EOPNOTSUPP for explicit placement.
+ * CPU offline requests cancel the session, including if hotplug rolls back.
+ * STOPPING -> STOPPED includes asynchronous ownership drain; the app continues.
+ * Legacy status/reason layouts are unchanged: placement failures use MON_ERROR
+ * plus the negative errno below. No silent fallback to another scanner CPU.
+ */
+#define CMDP_MON_CPU_AUTO (-1)
+struct cmdp_monitor_cpu_config {
+	__u32 size, version;
+	__s32 cpu;
+	__u32 reserved;
+};
+struct cmdp_monitor_cpu_status {
+	__u32 size, version;
+	__s32 cpu, last_cpu;
+	__s32 error;
+	__u32 reserved;
+	__u64 now_ns, work_items, wrong_cpu_work_items, offline_events;
+};
+#define CMDP_MON_CPU_CONFIG _IOW(CMDP_IOC_MAGIC, 35, struct cmdp_monitor_cpu_config)
+#define CMDP_MON_CPU_STATUS _IOWR(CMDP_IOC_MAGIC, 36, struct cmdp_monitor_cpu_status)
+
 #endif /* _UAPI_LINUX_CMDP_H */

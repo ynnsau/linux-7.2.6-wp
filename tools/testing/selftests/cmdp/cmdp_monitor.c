@@ -10,6 +10,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,8 @@
 
 static volatile sig_atomic_t interrupted;
 static unsigned int dirty_mode;
+static bool scanner_cpu_set;
+static atomic_bool scanner_cpu_failed;
 static const char *const reasons[] = { "none", "write", "invalidate", "control_stop",
 	"target_exit", "exec", "fork", "error", "thp_change", "scope_change" };
 static const char *const skips[] = { "vma", "thp_policy", "nonresident", "page_type",
@@ -172,6 +175,26 @@ static int batch_status_read(int fd)
 	return 0;
 }
 
+static int cpu_status_read(int fd)
+{
+	struct cmdp_monitor_cpu_status s;
+	INIT_REQ(s);
+	if (ioctl(fd, CMDP_MON_CPU_STATUS, &s)) {
+		if (errno == ENOTTY && !scanner_cpu_set) return 0;
+		return -1;
+	}
+	if (s.error || s.wrong_cpu_work_items)
+		atomic_store(&scanner_cpu_failed, true);
+	flockfile(stdout);
+	printf("{\"event\":\"cpu_status\",\"now_ns\":%llu,\"cpu\":%d,"
+	       "\"last_cpu\":%d,\"error\":%d,\"work_items\":%llu,"
+	       "\"wrong_cpu_work_items\":%llu,\"offline_events\":%llu}\n",
+	       s.now_ns, s.cpu, s.last_cpu, s.error, s.work_items,
+	       s.wrong_cpu_work_items, s.offline_events);
+	funlockfile(stdout);
+	return 0;
+}
+
 static int dirty_status_read(int fd)
 {
 	struct cmdp_monitor_dirty_status d;
@@ -220,7 +243,7 @@ static int status_read(int fd, struct cmdp_monitor_status *s, const char *event)
 		printf("%s\"%s\":%llu", i ? "," : "", reason(i), s->terminals[i]);
 	puts("}}");
 	funlockfile(stdout);
-	if (batch_status_read(fd) || dirty_status_read(fd))
+	if (cpu_status_read(fd) || batch_status_read(fd) || dirty_status_read(fd))
 		return -1;
 	return diagnostics_read(fd);
 }
@@ -420,6 +443,7 @@ static void usage(const char *name)
 		"  --inventory       scan-only session; do not ARM\n"
 		"  --monitor-off     launch/measure only; never open or attach CMD-P\n"
 		"  --target-cpus LIST  comma-separated CPU IDs, set in launched child before exec\n"
+		"  --scanner-cpu auto|N  periodic scanner placement, set before START (default auto)\n"
 		"  --dirty-observe   sample hardware dirty bits; never ARM\n"
 		"  --dirty-qualify   ARM only after a valid quiet interval\n"
 		"  --quiet-ms N      required quiet interval (default 10000, minimum 10)\n"
@@ -443,6 +467,7 @@ int main(int argc, char **argv)
 		{ "dirty-observe", 0, 0, 'o' }, { "dirty-qualify", 0, 0, 'q' },
 		{ "monitor-off", 0, 0, 'b' },
 		{ "target-cpus", 1, 0, 'C' },
+		{ "scanner-cpu", 1, 0, 'S' },
 		{ "quiet-ms", 1, 0, 'Q' },
 		{ "dirty-batch-pages", 1, 0, 'D' },
 		{ "wp-batch-pages", 1, 0, 'W' },
@@ -467,6 +492,9 @@ int main(int argc, char **argv)
 	INIT_REQ(dirty_config);
 	struct cmdp_monitor_batch_config batch_config;
 	INIT_REQ(batch_config);
+	struct cmdp_monitor_cpu_config cpu_config;
+	INIT_REQ(cpu_config);
+	cpu_config.cpu = CMDP_MON_CPU_AUTO;
 	batch_config.dirty_batch_pages = CMDP_BATCH_DEFAULT;
 	batch_config.wp_batch_pages = CMDP_BATCH_DEFAULT;
 	while ((opt = getopt_long(argc, argv, "+", opts, NULL)) != -1) {
@@ -478,6 +506,20 @@ int main(int argc, char **argv)
 		case '1': once = true; break;
 		case 's': a.flags |= CMDP_MONITOR_F_SCAN_ONLY; break;
 		case 'b': monitor_off = true; break;
+		case 'S':
+			if (scanner_cpu_set) {
+				fprintf(stderr, "repeated --scanner-cpu\n"); return 2;
+			}
+			if (strcmp(optarg, "auto")) {
+				for (const char *c = optarg; *c; c++) {
+					if (*c < '0' || *c > '9') {
+						fprintf(stderr, "invalid --scanner-cpu\n"); return 2;
+					}
+				}
+				cpu_config.cpu = number(optarg, INT_MAX);
+			}
+			scanner_cpu_set = true;
+			break;
 		case 'C':
 			if (target_cpus_set || !parse_target_cpus(optarg, &target_cpus)) {
 				fprintf(stderr, "invalid or repeated --target-cpus\n");
@@ -502,7 +544,8 @@ int main(int argc, char **argv)
 	}
 	if (!poll_ms || (pid && (optind != argc || target_cpus_set)) || (!pid && optind == argc) ||
 	    (!batch_config.dirty_batch_pages || !batch_config.wp_batch_pages) ||
-	    (monitor_off && (pid || dirty_mode || quiet_set || batch_set || a.flags || once || limit || seconds)) ||
+	    (monitor_off && (pid || dirty_mode || quiet_set || batch_set || scanner_cpu_set || a.flags || once || limit || seconds)) ||
+	    (once && cpu_config.cpu != CMDP_MON_CPU_AUTO) ||
 	    (dirty_mode && (a.flags & CMDP_MONITOR_F_SCAN_ONLY)) ||
 	    (quiet_set && (!dirty_mode || dirty_config.quiet_ms < 10))) {
 		usage(argv[0]); return 2;
@@ -529,6 +572,10 @@ int main(int argc, char **argv)
 		a.pidfd = pidfd;
 		if (ioctl(fd, CMDP_MON_ATTACH, &a)) { perror("CMDP_MON_ATTACH"); goto out; }
 		attached = true;
+		if (ioctl(fd, CMDP_MON_CPU_CONFIG, &cpu_config) &&
+		    (errno != ENOTTY || scanner_cpu_set)) {
+			perror("CMDP_MON_CPU_CONFIG"); goto out;
+		}
 		if (ioctl(fd, CMDP_MON_BATCH_CONFIG, &batch_config) &&
 		    (errno != ENOTTY || batch_set)) {
 			perror("CMDP_MON_BATCH_CONFIG"); goto out;
@@ -630,6 +677,7 @@ out:
 				result = 1;
 		}
 	}
+	if (atomic_load(&scanner_cpu_failed)) result = 1;
 	if (fd >= 0 && close(fd)) result = 1;
 	if (own) {
 		/* Lifecycle stops report incomplete monitoring, but must not kill the app. */

@@ -10,7 +10,8 @@ STATUS_EVENTS = {'status', 'stopping_status', 'observation_end', 'final'}
 COHORT_EVENTS = {'sweep', 'cohort_snapshot', 'cohort_observation_end', 'cohort_final'}
 
 
-def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
+def validate(path, minimum=1, compute_seconds=0, require_admissions=True,
+             expected_cpu_offline=False):
     errors = []
     records = []
     try:
@@ -45,7 +46,7 @@ def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
         completed = len(completed_ids) if completed_ids else None
     if len(finals) != 1:
         errors.append('Expected exactly one final kernel status; final state is unknown or ambiguous')
-    if len(exits) != 1 or exits[0].get('exit_code') != 0:
+    if len(exits) != 1 or exits[0].get('exit_code') != (1 if expected_cpu_offline else 0):
         errors.append('Controller did not exit successfully')
     for record in records:
         if record.get('event') == 'target_exit' and record.get('exit_code') != 0:
@@ -62,7 +63,7 @@ def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
         for key in ('active', 'resource_failures', 'reports_dropped'):
             if final.get(key, 1):
                 errors.append(f'Final {key} is nonzero or absent')
-        if final.get('stop_reason') not in ('control_stop', 'target_exit'):
+        if final.get('stop_reason') not in (('error',) if expected_cpu_offline else ('control_stop', 'target_exit')):
             errors.append('Unexpected stop reason: ' + str(final.get('stop_reason')))
         if final.get('first_arms', 0) + final.get('rearms', 0) != final.get('active', 0) + sum(final.get('terminals', {}).values()):
             errors.append('Session generation counts do not balance')
@@ -79,7 +80,7 @@ def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
             errors.append(f'Cohort {ident} first/rearm survivor counts do not balance')
         # Linux ABI errno values, including when reporting on macOS.
         normal_interruption = (not cohort.get('complete') and cohort.get('error') in (-108, -3)
-                               and final.get('stop_reason') in ('control_stop', 'target_exit'))
+                               and final.get('stop_reason') in (('error',) if expected_cpu_offline else ('control_stop', 'target_exit')))
         if cohort.get('error') and not normal_interruption:
             errors.append(f'Cohort {ident} has error {cohort["error"]}')
         # An in-flight cohort legitimately has no end timestamp yet.
@@ -87,6 +88,30 @@ def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
             errors.append(f'Cohort {ident} clock order invalid')
     if final and sum(c['first_arms'] + c['rearms'] for c in final_cohorts.values()) != final.get('first_arms', 0) + final.get('rearms', 0):
         errors.append('Retained cohorts do not account for all session generations')
+    cpu_records = sorted((x for x in records if x.get('event') == 'cpu_status'),
+                         key=lambda x: x.get('now_ns', 0))
+    cpu_final = cpu_records[-1] if cpu_records else {}
+    previous_cpu = None
+    for record in cpu_records:
+        if record.get('cpu') != cpu_final.get('cpu'):
+            errors.append('Scanner CPU policy changed during a reported session')
+        if record.get('wrong_cpu_work_items', 0):
+            errors.append('Scanner work started on the wrong CPU')
+        if record.get('work_items', 0) and record.get('cpu', -1) >= 0 and record.get('last_cpu') != record['cpu']:
+            errors.append('Scanner last observed CPU differs from request')
+        if not expected_cpu_offline and (record.get('error') or record.get('offline_events')):
+            errors.append('Unexpected scanner CPU error or removal')
+        if previous_cpu:
+            for key in ('work_items', 'wrong_cpu_work_items', 'offline_events'):
+                if record.get(key, 0) < previous_cpu.get(key, 0):
+                    errors.append('Scanner CPU counter decreased: ' + key)
+        previous_cpu = record
+    if expected_cpu_offline:
+        if not (cpu_final.get('cpu', -1) >= 0 and cpu_final.get('error') == -19 and
+                cpu_final.get('offline_events') == 1 and cpu_final.get('work_items', 0) > 0):
+            errors.append('Expected CPU-offline error lacks independent CPU status evidence')
+        if len([x for x in records if x.get('event') == 'target_exit' and x.get('exit_code') == 0]) != 1:
+            errors.append('CPU-offline test did not preserve a normally exiting target')
     dirty_records = sorted((x for x in records if x.get('event') == 'dirty_status'),
                            key=lambda x: x.get('now_ns', 0))
     dirty_final = dirty_records[-1] if dirty_records else {}
@@ -175,7 +200,8 @@ def validate(path, minimum=1, compute_seconds=0, require_admissions=True):
         'final_state_known': len(finals) == 1, 'last_observed': observed,
         'observation_end': observations[-1] if observations else {},
         'progress': progress[-1] if progress else {},
-        'dirty': dirty_final, 'diagnostics': diagnostic_final,
+        'dirty': dirty_final, 'diagnostics': diagnostic_final, 'cpu': cpu_final,
+        'expected_cpu_offline': expected_cpu_offline,
         'stop_request': stop_requests[-1] if stop_requests else {},
         'stop_return': stop_returns[-1] if stop_returns else {},
         'trial_count': len(trials), 'total_trial_seconds': sum(trials), 'final': final,

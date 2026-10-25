@@ -46,6 +46,51 @@ test -w /proc/sys/kernel/numa_balancing || rc=1
 test "$rc" = 0 || finish
 echo 0 > /proc/sys/kernel/numa_balancing
 case "$suite" in
+cpu)
+    run /tests/cmdp_cpu_test
+    mkdir -p /sys/kernel/tracing
+    mount -t tracefs tracefs /sys/kernel/tracing || { rc=1; finish; }
+    trace=/sys/kernel/tracing
+    echo 0 > "$trace/tracing_on"
+    echo 0 > "$trace/events/enable"
+    echo 8192 > "$trace/buffer_size_kb"
+    echo > "$trace/trace"
+    echo 1 > "$trace/events/workqueue/workqueue_execute_start/enable"
+    echo 1 > "$trace/tracing_on"
+    echo CMDP_REPORT_BEGIN cpu-bound
+    /tests/cmdp_monitor --scanner-cpu 1 --target-cpus 0 --period-ms 50 \
+        --dirty-qualify --quiet-ms 100 --max-pages 32768 --max-history 65536 \
+        --duration-sec 2 -- /tests/cmdp_fixture --mode hotcold --seconds 3 \
+        > /tmp/cpu-bound.jsonl 2> /tmp/cpu-bound.log
+    result=$?
+    cat /tmp/cpu-bound.jsonl /tmp/cpu-bound.log
+    echo "CMDP_REPORT_END cpu-bound result=$result"
+    test "$result" = 0 || { rc=1; finish; }
+    grep -q '"event":"cpu_status".*"cpu":1,"last_cpu":1,"error":0' /tmp/cpu-bound.jsonl || { rc=1; finish; }
+    echo 0 > "$trace/tracing_on"
+    echo 0 > "$trace/events/workqueue/workqueue_execute_start/enable"
+    echo CMDP_CPU_TRACE_BEGIN
+    grep 'function cmdp_monitor_work$' "$trace/trace"
+    cat "$trace"/per_cpu/cpu*/stats
+    echo CMDP_CPU_TRACE_END
+    echo CMDP_REPORT_BEGIN cpu-offline
+    /tests/cmdp_monitor --scanner-cpu 1 --target-cpus 0 --period-ms 50 --poll-ms 50 \
+        --dirty-qualify --quiet-ms 100 --max-pages 32768 --max-history 65536 \
+        -- /tests/cmdp_fixture --mode hotcold --seconds 4 \
+        > /tmp/cpu-offline.jsonl 2> /tmp/cpu-offline.log &
+    monitor=$!
+    sleep 1
+    echo 0 > /sys/devices/system/cpu/cpu1/online || { rc=1; finish; }
+    wait "$monitor"
+    result=$?
+    echo 1 > /sys/devices/system/cpu/cpu1/online || { rc=1; finish; }
+    cat /tmp/cpu-offline.jsonl /tmp/cpu-offline.log
+    echo "CMDP_REPORT_END cpu-offline result=$result"
+    test "$result" = 1 || { rc=1; finish; }
+    grep -q '"event":"cpu_status".*"error":-19.*"offline_events":1' /tmp/cpu-offline.jsonl || { rc=1; finish; }
+    grep -q '"event":"target_exit","exit_code":0' /tmp/cpu-offline.jsonl || { rc=1; finish; }
+    test "$(cat /sys/devices/system/cpu/online)" = '0-3' || { rc=1; finish; }
+    ;;
 fused)
     run /tests/cmdp_fused_test
     ;;

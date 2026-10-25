@@ -17,7 +17,7 @@ require(sum(x.strip()=='CMDP_RANGE_VM_START' for x in lines)==1,'Missing/ambiguo
 require(sum(x.strip()=='CMDP_RANGE_VM_RESULT=0' for x in lines)==1,'Missing/ambiguous passing VM result')
 for item in ('host-boot-id','host-uname','host-cmdp'):
     require((run/(item+'.before')).read_bytes()==(run/(item+'.after')).read_bytes(), item+' changed')
-bad=re.compile(r'BUG:|WARNING:|Oops:|KASAN:|Kernel panic|possible circular locking|inconsistent lock state|general protection fault|CMDP_CONSOLE_DRAIN_FAILED|^not ok ')
+bad=re.compile(r'BUG:|WARNING:|Oops:|KASAN:|Kernel panic|possible circular locking|inconsistent lock state|general protection fault|enqueued on deprecated workqueue|CMDP_CONSOLE_DRAIN_FAILED|^not ok ')
 warnings=[x for x in lines if bad.search(x)]
 require(not warnings,'Guest warning/failure signature')
 # Every TAP suite must have an explicit, complete sequence and nonzero plan.
@@ -60,6 +60,8 @@ for line in lines:
 require(active is None,'Unclosed report block')
 spec=importlib.util.spec_from_file_location('validate_run',str(a.scripts_dir/'validate-run.py'))
 validator=importlib.util.module_from_spec(spec); spec.loader.exec_module(validator)
+suite_match=re.search(r'cmdp_suite=([^ \"\\]+)',(run/'qemu-command.txt').read_text())
+suite=suite_match.group(1) if suite_match else 'unknown'
 report_root=run/'reports'
 report_root.mkdir(exist_ok=True)
 workloads={}
@@ -67,9 +69,10 @@ for name, block in blocks.items():
     out=report_root/name; out.mkdir(exist_ok=True)
     (out/'monitor.jsonl').write_text('\n'.join(block['json'])+'\n')
     target='\n'.join(block['target'])+'\n'; (out/'target.log').write_text(target)
-    result=validator.validate(out, minimum=1)
+    offline = suite == 'cpu' and name == 'cpu-offline'
+    result=validator.validate(out, minimum=1, expected_cpu_offline=offline)
     local_errors=list(result['errors'])
-    if block['exit']!=0: local_errors.append('Controller block exit is not zero')
+    if block['exit']!=(1 if offline else 0): local_errors.append('Unexpected controller block exit')
     if name.startswith('recovery-') and not result.get('diagnostics'):
         local_errors.append('Recovery workload lacks invalidation/sampling diagnostics')
     if 'bfs' in name or name.startswith('recovery-pr'):
@@ -78,7 +81,7 @@ for name, block in blocks.items():
         if marks!=['PASS']*8 or len(trials)!=8: local_errors.append('Expected exactly 8 verified generated graph trials')
         application='pr' if name.startswith('recovery-pr') else 'bfs'
         result[application+'_verifications']=len(marks); result[application+'_trials']=len(trials)
-    if name in ('hotcold','concurrent','churn'):
+    if name in ('hotcold','concurrent','churn','cpu-bound','cpu-offline'):
         if re.findall(r'fixture_validation=(PASS|FAIL)',target)!=['PASS']:
             local_errors.append('Expected one fixture validation PASS')
     result['errors']=local_errors; result['pass']=not local_errors
@@ -87,7 +90,34 @@ for name, block in blocks.items():
     require(result['pass'],'Workload failed: '+name)
 suite_match=re.search(r'cmdp_suite=([^ "\\]+)',(run/'qemu-command.txt').read_text())
 suite=suite_match.group(1) if suite_match else 'unknown'
-if suite=='fused':
+if suite=='cpu':
+    require(set(blocks)=={'cpu-bound','cpu-offline'}, 'Missing bound/CPU-offline launcher cases')
+    trace_lines=[]; in_trace=False
+    for line in lines:
+        if line.strip()=='CMDP_CPU_TRACE_BEGIN': in_trace=True
+        elif line.strip()=='CMDP_CPU_TRACE_END': in_trace=False
+        elif in_trace: trace_lines.append(line)
+    entries=[x for x in trace_lines if 'function cmdp_monitor_work' in x]
+    require(len(entries)>=8 and all(re.search(r'\[0*1\].*workqueue_execute_start:',x) for x in entries),
+            'Independent workqueue trace does not prove repeated CPU1 placement')
+    overruns=[int(m.group(1)) for x in trace_lines for m in [re.fullmatch(r'overrun: ([0-9]+)',x.strip())] if m]
+    require(len(overruns)==4 and not any(overruns), 'Missing or overflowing per-CPU trace buffers')
+
+    require(len(taps)==1 and taps[0]['planned']>=200, 'Missing CPU placement/hotplug TAP checks')
+    cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_CPU_CASE ')]
+    placement=[x for x in cases if x.get('kind')=='placement']
+    require(len(placement)==8 and {(x.get('cpu'),x.get('threads'),x.get('mode')) for x in placement} ==
+            {(str(c),str(t),str(m)) for c in (1,2) for t in (1,4) for m in (1,2)},
+            'Missing one/four-thread and two-CPU placement matrix')
+    require({x.get('phase') for x in cases if x.get('kind')=='offline'} == {'0','1','2'},
+            'Missing live ARM and pre-flush hotplug cases')
+    for kind in ('stop-offline-race','close-offline-race'):
+        require(sum(x.get('kind')==kind for x in cases)==3, 'Missing teardown repetitions: '+kind)
+    for name, result in workloads.items():
+        cpu=result.get('cpu', {})
+        require(cpu.get('cpu')==cpu.get('last_cpu')==1 and cpu.get('work_items',0)>1 and
+                cpu.get('wrong_cpu_work_items')==0, 'Unproven launcher placement: '+name)
+elif suite=='fused':
     require(not blocks and len(taps)==1 and taps[0]['planned']>=490, 'Missing shared-flush fixture TAP checks')
     cases=[dict(re.findall(r'(\w+)=([^ ]+)',x)) for x in lines if x.startswith('CMDP_FUSED_CASE ')]
     pairs=((1,1),(1,64),(64,1),(17,91),(64,64),(512,512),(4096,4096),

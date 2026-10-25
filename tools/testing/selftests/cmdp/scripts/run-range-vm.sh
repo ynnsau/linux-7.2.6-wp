@@ -1,11 +1,11 @@
 #!/bin/bash
 # No host kernel installation, host CMD-P workload, disk passthrough, or network.
 set -euo pipefail
-kernel=${1:?Usage: run-range-vm.sh KERNEL INITRAMFS NEW_RUN_DIR small|scale|numa|dirty|recovery-baseline|recovery|recovery-numa|batch|fused}
+kernel=${1:?Usage: run-range-vm.sh KERNEL INITRAMFS NEW_RUN_DIR small|scale|numa|dirty|recovery-baseline|recovery|recovery-numa|batch|fused|cpu}
 initrd=${2:?initramfs required}
 out=${3:?new run directory required}
 suite=${4:-small}
-case "$suite" in small|scale|numa|dirty|recovery-baseline|recovery|recovery-numa|batch|fused) ;; *) exit 2;; esac
+case "$suite" in small|scale|numa|dirty|recovery-baseline|recovery|recovery-numa|batch|fused|cpu) ;; *) exit 2;; esac
 test ! -e "$out" || { echo "Refusing existing run directory: $out" >&2; exit 2; }
 test -r "$kernel" && test -r "$initrd" && test -r /dev/kvm && test -w /dev/kvm
 qemu=${QEMU:-qemu-system-x86_64}
