@@ -44,6 +44,21 @@ def summarize(root, output):
         ops = row['window_end']['operations'] - row['window_start']['operations']
         assert ops == row['successful_operations']
         assert abs(row['qps'] - ops / row['measured_seconds']) < 1e-8
+        status = []
+        for line in (run / 'ycsb.log').read_text().splitlines():
+            m = re.search(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d:\d{3}) (\d+) sec: (\d+) operations;', line)
+            if m:
+                stamp = datetime.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S:%f').replace(tzinfo=datetime.timezone.utc)
+                status.append({'epoch': stamp.timestamp(), 'elapsed_s': int(m.group(2)), 'operations': int(m.group(3))})
+        start = next(x for x in status if x['elapsed_s'] >= 30)
+        end = next(x for x in status if x['elapsed_s'] >= start['elapsed_s'] + 120)
+        assert start == row['window_start'] and end == row['window_end']
+        middle = min(status, key=lambda x: abs(x['epoch'] - (start['epoch'] + 60)))
+        first_qps = (middle['operations'] - start['operations']) / (middle['epoch'] - start['epoch'])
+        second_qps = (end['operations'] - middle['operations']) / (end['epoch'] - middle['epoch'])
+        row['first_half_qps'] = first_qps
+        row['second_half_qps'] = second_qps
+        row['second_vs_first_half_pct'] = 100 * (second_qps / first_qps - 1)
         obs = [json.loads(line) for line in (run / 'observations.jsonl').read_text().splitlines()]
         for x in obs:
             assert x['cmdp'] == row['cmdp_before']

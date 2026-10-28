@@ -17,6 +17,10 @@ if [ ! -d YCSB/.git ]; then
   git -C YCSB fetch --depth 1 origin ae02b31fa7784b3892f121c06638aa0cd972fa06
   git -C YCSB checkout --detach FETCH_HEAD
 fi
+test "$(git -C redis rev-parse HEAD)" = 1a2574ce1551d3de6e0b4a56756c0fdbc6659e4f
+test "$(git -C YCSB rev-parse HEAD)" = ae02b31fa7784b3892f121c06638aa0cd972fa06
+git -C redis diff --exit-code
+git -C YCSB diff --exit-code
 git -C redis rev-parse HEAD
 git -C YCSB rev-parse HEAD
 if [ ! -x "$study/tools/apache-maven-3.10.0/bin/mvn" ]; then

@@ -361,6 +361,8 @@ def prepare():
     root = mkdir(ART / 'prepare')
     assert not (ART / 'golden/manifest.json').exists(), 'Golden dataset already exists'
     baseline = cmdp_stats()
+    if (ART / 'golden/dump.rdb').exists() and (root / 'loaded.json').exists():
+        return finalize_golden(root, baseline)
     p, r, _ = start_redis(root, mkdir(root / 'data'))
     try:
         empty = r.info('memory')['used_memory']
@@ -384,26 +386,61 @@ def prepare():
     (root / 'data/dump.rdb').replace(golden / 'dump.rdb')
     check = command([SOURCE / 'redis/src/redis-check-rdb', golden / 'dump.rdb'])
     (root / 'rdb-check.log').write_text(check + '\n')
-    p, r, restore_s = start_redis(mkdir(root / 'restore-check'), golden)
-    try:
-        restored = validate_db(r, count, validation['samples'])
-        used = restored['info']['used_memory']
-        assert 0.95 * 16 * GIB <= used <= 1.05 * 16 * GIB, 'Restored size outside target: %r' % used
-        manifest = {'at': now(), 'recordcount': count, 'target_used_memory_bytes': 16 * GIB,
-                    'restored_used_memory_bytes': used, 'restored_rss_bytes': restored['info']['used_memory_rss'],
-                    'restore_seconds': restore_s, 'samples': validation['samples'],
-                    'rdb_sha256': digest(golden / 'dump.rdb'), 'rdb_bytes': (golden / 'dump.rdb').stat().st_size,
-                    'redis_commit': command(['git', '-C', SOURCE / 'redis', 'rev-parse', 'HEAD']),
-                    'ycsb_commit': command(['git', '-C', YCSB, 'rev-parse', 'HEAD']),
-                    'redis_binary_sha256': digest(REDIS), 'cmdp_before': baseline, 'cmdp_after': cmdp_stats(),
-                    'loaded_info': validation['info'], 'restored_info': restored['info']}
-        assert manifest['cmdp_before'] == manifest['cmdp_after']
-        jsave(golden / 'manifest.json', manifest)
-        os.chmod(str(golden / 'dump.rdb'), 0o444)
-        os.chmod(str(golden), 0o555)
-    finally:
-        stop_redis(p, r)
-    print(json.dumps({'prepared': True, 'recordcount': count, 'used_GiB': used / GIB, 'restore_s': restore_s}), flush=True)
+    finalize_golden(root, baseline)
+
+
+def finalize_golden(root, baseline):
+    """Calibrate on restored allocation; RDB reload can compact live structures."""
+    golden = ART / 'golden'
+    loaded = json.loads((root / 'loaded.json').read_text())
+    count, validation = loaded['recordcount'], loaded['validation']
+    for attempt in range(4):
+        directory = root / ('size-round-%d' % attempt)
+        assert not directory.exists(), 'Preserve incomplete calibration round before retry'
+        p, r, restore_s = start_redis(mkdir(directory), golden)
+        try:
+            restored = validate_db(r, count, validation['samples'])
+            used = restored['info']['used_memory']
+            jsave(directory / 'restored.json', {'recordcount': count, 'restore_seconds': restore_s,
+                                               'validation': restored})
+            if 0.95 * 16 * GIB <= used <= 1.05 * 16 * GIB:
+                manifest = {'at': now(), 'recordcount': count, 'target_used_memory_bytes': 16 * GIB,
+                            'restored_used_memory_bytes': used, 'restored_rss_bytes': restored['info']['used_memory_rss'],
+                            'restore_seconds': restore_s, 'samples': validation['samples'],
+                            'rdb_sha256': digest(golden / 'dump.rdb'), 'rdb_bytes': (golden / 'dump.rdb').stat().st_size,
+                            'redis_commit': command(['git', '-C', SOURCE / 'redis', 'rev-parse', 'HEAD']),
+                            'ycsb_commit': command(['git', '-C', YCSB, 'rev-parse', 'HEAD']),
+                            'redis_binary_sha256': digest(REDIS), 'cmdp_before': baseline, 'cmdp_after': cmdp_stats(),
+                            'loaded_info': validation['info'], 'restored_info': restored['info']}
+                assert manifest['cmdp_before'] == manifest['cmdp_after']
+                jsave(golden / 'manifest.json', manifest)
+                os.chmod(str(golden / 'dump.rdb'), 0o444)
+                os.chmod(str(golden), 0o555)
+                print(json.dumps({'prepared': True, 'recordcount': count, 'used_GiB': used / GIB,
+                                  'restore_s': restore_s}), flush=True)
+                return
+            assert attempt < 3, 'Restored size failed to converge'
+            target = int(round((count * (16 * GIB) / used) / 10000.0) * 10000)
+            assert target != count
+            # SAVE replaces the file atomically; this hard link preserves the prior image.
+            os.link(str(golden / 'dump.rdb'), str(directory / 'prior-size.rdb'))
+            jsave(directory / 'adjustment.json', {'old_count': count, 'new_count': target, 'restored_used_memory': used,
+                                                 'prior_rdb_sha256': digest(directory / 'prior-size.rdb')})
+            if target > count:
+                load_records(directory / 'extend-load', r, target, start=count, n=target - count)
+            else:
+                assert r.call('FLUSHDB', 'SYNC') == 'OK'
+                load_records(directory / 'replacement-load', r, target)
+            count = target
+            validation = validate_db(r, count)
+            jsave(directory / 'loaded.json', {'recordcount': count, 'validation': validation})
+            r.sock.settimeout(600)
+            assert r.call('SAVE') == 'OK'
+            r.sock.settimeout(10)
+            jsave(root / 'loaded.json', {'recordcount': count, 'validation': validation})
+        finally:
+            stop_redis(p, r)
+        (directory / 'rdb-check.log').write_text(command([SOURCE / 'redis/src/redis-check-rdb', golden / 'dump.rdb']) + '\n')
 
 
 STATUS_RE = re.compile(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d:\d{3}) (\d+) sec: (\d+) operations;')
@@ -666,6 +703,7 @@ def restore():
     try:
         validation = validate_db(r, manifest['recordcount'], manifest['samples'])
         info = {'pid': p.pid, 'boot_id': policies()['boot_id'], 'directory': str(directory),
+                'redis_run_id': validation['info']['run_id'],
                 'at': now(), 'restore_seconds': elapsed, 'recordcount': manifest['recordcount'],
                 'used_memory': validation['info']['used_memory'], 'rdb_sha256': manifest['rdb_sha256']}
         jsave(ART / 'manual-server.json', info)
@@ -685,7 +723,8 @@ def stop_manual():
     assert P('/proc/%d/exe' % pid).resolve() == REDIS.resolve()
     r = Redis()
     try:
-        assert r.info('server')['process_id'] == pid
+        info = r.info('server')
+        assert info['process_id'] == pid and info['run_id'] == state['redis_run_id']
         r.call('SHUTDOWN', 'NOSAVE')
     except EOFError:
         pass
