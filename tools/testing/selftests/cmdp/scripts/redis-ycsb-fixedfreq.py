@@ -656,7 +656,12 @@ def main():
         captured = sorted((ROOT / 'campaign-v1').glob('*/capture-receipt.json'))
         analyzed = sorted((ROOT / 'campaign-v1').glob('*/receipt.json'))
         failures = sorted((ROOT / 'campaign-v1').glob('*/failure.json'))
+        profile = json.loads((ROOT / 'profile.json').read_text()) if (ROOT / 'profile.json').exists() else {}
+        suite_state = json.loads((ROOT / 'suite-state.json').read_text()) if (ROOT / 'suite-state.json').exists() else None
         emit('status', captured=len(captured), analyzed=len(analyzed), expected=27,
+             pilots_analyzed=len(list((ROOT / 'pilots').glob('*/receipt.json'))),
+             suite=suite_state,
+             frequency={'status': profile.get('status'), 'selected_khz': profile.get('selected_khz')},
              failures=[str(x) for x in failures], state=json.loads((ROOT / 'campaign-state.json').read_text())
              if (ROOT / 'campaign-state.json').exists() else None)
         return
