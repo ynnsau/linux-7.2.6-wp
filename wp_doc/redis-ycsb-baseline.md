@@ -50,3 +50,15 @@ python3 tools/testing/selftests/cmdp/scripts/analyze-redis-ycsb.py CAMPAIGN_DIRE
 ```
 
 The analyzer independently verifies receipts, operation arithmetic, errors, monitoring inactivity and 3 repetitions; it produces JSON summaries and throughput, CPU/latency and timeline figures. Plans/setup go in the study's experiments folder; measured findings and evidence go in results. No kernel/GRUB/reboot change is part of this experiment.
+
+## Completed baseline
+
+The 2026-10-28 campaign completed all 63 measured runs. See [the measured results](redis-ycsb-baseline-results.md) for peak QPS, repetitions, saturation, latency, GC, and snapshot restoration. Eight YCSB workers on eight client cores were within 0.25% of all observed peaks.
+
+Read durable campaign progress without contacting Redis:
+
+```sh
+python3 /home/yans3/cmdp-v2/redis-ycsb-study/tools/status-redis-ycsb.py
+```
+
+The status helper reports the current phase, latest completed run, CPU/affinity/memory observations and launcher exit status. It does not modify the campaign or start database activity.

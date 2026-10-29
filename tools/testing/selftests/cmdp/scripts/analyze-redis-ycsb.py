@@ -24,6 +24,24 @@ def save(path, obj):
     path.write_text(json.dumps(obj, indent=2, sort_keys=True) + '\n')
 
 
+def gc_window(path, start, end):
+    """Sum only stop-the-world pause overlap with the selected UTC window."""
+    pauses = []
+    pattern = re.compile(r'^\[([^]]+)\].*\[gc\s*\].*GC\(\d+\) Pause .* ([0-9.]+)ms$')
+    for line in path.read_text().splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        finish = datetime.datetime.strptime(match.group(1), '%Y-%m-%dT%H:%M:%S.%f%z').timestamp()
+        duration = float(match.group(2))
+        overlap = max(0, min(end, finish) - max(start, finish - duration / 1000)) * 1000
+        if overlap:
+            pauses.append((duration, overlap))
+    return {'gc_pause_count': len(pauses), 'gc_pause_ms': sum(p[1] for p in pauses),
+            'gc_max_pause_ms': max((p[0] for p in pauses), default=0),
+            'gc_pause_pct_of_window': sum(p[1] for p in pauses) / ((end - start) * 10)}
+
+
 def summarize(root, output):
     state = json.loads((root / 'campaign-state.json').read_text())
     assert state['status'] == 'complete', 'Campaign has not finished'
@@ -59,6 +77,7 @@ def summarize(root, output):
         row['first_half_qps'] = first_qps
         row['second_half_qps'] = second_qps
         row['second_vs_first_half_pct'] = 100 * (second_qps / first_qps - 1)
+        row.update(gc_window(run / 'gc.log', start['epoch'], end['epoch']))
         obs = [json.loads(line) for line in (run / 'observations.jsonl').read_text().splitlines()]
         for x in obs:
             assert x['cmdp'] == row['cmdp_before']
@@ -67,6 +86,18 @@ def summarize(root, output):
             assert x['info']['aof_enabled'] == x['info']['rdb_bgsave_in_progress'] == 0
             assert x['redis']['allowed'] == '1'
             assert x['client']['allowed'] == '26-%d' % (25 + row['client_cores'])
+            assert x['redis_threads_checked'] > 0 and x['client_threads_checked'] > 0
+        window = [x for x in obs if start['epoch'] <= x['epoch'] <= end['epoch']]
+        assert len(window) >= 118
+        first, last = window[0], window[-1]
+        span = last['monotonic'] - first['monotonic']
+        for process in ('redis', 'client'):
+            cpu = 100 * (last[process]['cpu_s'] - first[process]['cpu_s']) / span
+            assert abs(cpu - row[process + '_cpu_pct']) < 1e-8
+        row['redis_alloc_min'] = min(x['info']['used_memory'] for x in window)
+        row['redis_alloc_max'] = max(x['info']['used_memory'] for x in window)
+        hist_ops = sum(v['count'] for v in row['latency'].values())
+        assert abs(hist_ops - ops) <= max(2 * row['threads'], ops * 0.001)
         for op in ('READ', 'UPDATE'):
             d = row['exported'].get(op)
             if d:
@@ -86,6 +117,7 @@ def summarize(root, output):
             row['redis_anon_huge_kib_' + phase] = int(re.search(r'^AnonHugePages:\s+(\d+)', smaps, re.M).group(1))
         rows.append(row)
     assert len(rows) == state['completed']
+    assert all(r['cmdp_before'] == rows[0]['cmdp_before'] for r in rows), 'CMD-P activity between runs'
     groups = {}
     for row in rows:
         groups.setdefault((row['workload'], row['client_cores'], row['threads']), []).append(row)
@@ -96,11 +128,14 @@ def summarize(root, output):
              'qps': [r['qps'] for r in members], 'qps_median': statistics.median(r['qps'] for r in members),
              'qps_min': min(r['qps'] for r in members), 'qps_max': max(r['qps'] for r in members)}
         for field in ('redis_cpu_pct', 'client_pool_util_pct', 'read_p99_us', 'redis_used_memory_mean',
-                      'redis_rss_peak', 'client_rss_peak', 'restore_seconds', 'redis_freq_khz_median'):
+                      'redis_rss_peak', 'client_rss_peak', 'restore_seconds', 'redis_freq_khz_median',
+                      'gc_pause_pct_of_window', 'gc_max_pause_ms', 'second_vs_first_half_pct'):
             d[field + '_median'] = statistics.median(r[field] for r in members)
         updates = [r['update_p99_us'] for r in members if r['update_p99_us'] is not None]
         d['update_p99_us_median'] = statistics.median(updates) if updates else None
         stats.append(d)
+    for w in 'ABC':
+        assert all((w, config['client_cores_initial'], t) in groups for t in config['concurrency'])
     peaks = []
     for w in 'ABC':
         choices = [g for g in stats if g['workload'] == w]
@@ -125,6 +160,108 @@ def summarize(root, output):
     output.mkdir(parents=True, exist_ok=True)
     save(output / 'redis-ycsb-summary.json', result)
     return result
+
+
+def report(out, data):
+    """Write a compact measured report alongside the machine-readable evidence."""
+    rows, groups, peaks = data['runs'], data['groups'], data['peaks']
+    def value(x, digits=1):
+        return '—' if x is None else ('{:,.' + str(digits) + 'f}').format(x)
+    lines = [
+        '# Redis–YCSB baseline results', '',
+        'Maximum observed sustained successful logical YCSB operations/s for this setup. '
+        'Each configuration has three repetitions, each with 30 seconds of warm-up and '
+        '120 measured seconds. No rate cap or latency SLA was imposed.', '',
+        'Redis uses CPU1 and memory node0. The YCSB JVM uses a separate CPU pool on node1. '
+        'Every run reloads the same saved database. CMD-P sampling and ARM remain inactive.', '',
+        '## Peak throughput', '',
+        '| Workload | Workers / client cores | Median ops/s | Three-run range | Redis CPU | Read / update p99 (µs) | Fewest workers within 3% |',
+        '| --- | ---: | ---: | ---: | ---: | ---: | ---: |'
+    ]
+    for p in peaks:
+        lines.append('| %s | %d / %d | %s | %s–%s | %.1f%% | %s / %s | %d (%d cores) |' % (
+            p['workload'], p['threads'], p['client_cores'], value(p['qps_median']),
+            value(p['qps_min']), value(p['qps_max']), p['redis_cpu_pct_median'],
+            value(p['read_p99_us_median'], 0), value(p['update_p99_us_median'], 0),
+            p['near_peak_threads'], p['near_peak_client_cores']))
+    lines += ['', 'The latency entries are medians of the three per-run p99 values; they are not '
+              'percentiles pooled across repetitions. Per-run percentiles merge histograms only '
+              'inside the selected measurement window.', '', '## Memory and validation', '',
+              '- Records: **%s**, with ten 100-byte fields, default hashed keys and the Redis binding’s index.' % value(rows[0]['recordcount'], 0),
+              '- Measured Redis allocation across all observations: **%.3f–%.3f GiB**; largest Redis RSS: **%.3f GiB**.' % (
+                  min(r['redis_alloc_min'] for r in rows)/GIB, max(r['redis_alloc_max'] for r in rows)/GIB,
+                  max(r['redis_rss_peak'] for r in rows)/GIB),
+              '- Snapshot restoration: median **%.2f s**, range **%.2f–%.2f s**, excluded from throughput. File cache was not dropped.' % (
+                  statistics.median(r['restore_seconds'] for r in rows), min(r['restore_seconds'] for r in rows), max(r['restore_seconds'] for r in rows)),
+              '- Verified **%d runs** and **%d evidence-file hashes**.' % (data['verified_runs'], data['verified_evidence_files']),
+              '- Zero non-OK operations, swaps, evictions, expirations or persistence activity; CMD-P counters unchanged.',
+              '- Host policy and thread affinity checks passed. No new kernel crash/OOM/lockup messages were found.',
+              '- Golden RDB SHA-256: `%s`.' % data['config']['rdb_sha256'], '',
+              '## Stability diagnostics at each peak', '',
+              '| Workload | Individual ops/s | Second-half change, each run | Median GC pause fraction | Median longest GC pause |',
+              '| --- | --- | --- | ---: | ---: |']
+    for p in peaks:
+        members = [r for r in rows if r['run'] in p['runs']]
+        lines.append('| %s | %s | %s | %.3f%% | %.2f ms |' % (
+            p['workload'], ', '.join(value(r['qps']) for r in members),
+            ', '.join('%+.1f%%' % r['second_vs_first_half_pct'] for r in members),
+            p['gc_pause_pct_of_window_median'], p['gc_max_pause_ms_median']))
+    initial_cores = data['config']['client_cores_initial']
+    base = [g for g in groups if g['client_cores'] == initial_cores]
+    decisions = []
+    for w in 'ABC':
+        choices = sorted((g for g in base if g['workload'] == w), key=lambda g: g['threads'])
+        best, gains = 0, []
+        for g in choices:
+            gains.append(max(0, 100 * (g['qps_median'] / best - 1)) if best else 100)
+            best = max(best, g['qps_median'])
+        decisions.append('- %s: largest tested concurrency %d; the last two doublings improved '
+                         'the running best median by %.3f%% and %.3f%% (%s the 3%% threshold).' % (
+                             w, choices[-1]['threads'], gains[-2], gains[-1],
+                             'both below' if all(x < 3 for x in gains[-2:]) else 'not both below'))
+    pools = sorted({g['client_cores'] for g in groups})
+    decisions += ['', 'Client CPU pools tested: %s cores. Peak Redis CPU and client-pool '
+                  'utilization are recorded above and in the full sweep below.' % ', '.join(map(str, pools)), '']
+    common = []
+    for t in sorted({g['threads'] for g in base}):
+        candidates = [g for g in base if g['threads'] == t]
+        if len(candidates) == 3 and all(g['qps_median'] >= .97 * next(p['qps_median'] for p in peaks if p['workload'] == g['workload']) for g in candidates):
+            common.append((t, candidates))
+    if common:
+        threads, candidates = common[0]
+        loss = max(100 * (1 - g['qps_median'] / next(p['qps_median'] for p in peaks if p['workload'] == g['workload'])) for g in candidates)
+        decisions += ['**%d workers on %d client cores** are a useful common baseline: every '
+                      'workload is within %.3f%% of its observed peak.' % (threads, initial_cores, loss), '']
+        for g in candidates:
+            p = next(p for p in peaks if p['workload'] == g['workload'])
+            if (p['threads'], p['client_cores']) != (threads, initial_cores):
+                decisions.append('%s: the common setting has read p99 %.0f µs versus %.0f µs '
+                                 'at the observed peak setting (%d workers / %d cores).' % (
+                                     p['workload'], g['read_p99_us_median'], p['read_p99_us_median'], p['threads'], p['client_cores']))
+        decisions.append('')
+    lines += ['', 'Second-half change compares the final 60 seconds against the first 60 seconds '
+              'of the measured window. It is a diagnostic, not a post-hoc exclusion rule. '
+              'GC values cover stop-the-world pause overlap with that same window.', '',
+              '## Sweep stopping decision', ''] + decisions + [
+              '## Full concurrency sweep', '',
+              '| Workload | Client cores | Workers | Median ops/s | Min–max ops/s | Redis CPU | Client pool CPU | Read p99 (µs) | Update p99 (µs) |',
+              '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+    for g in groups:
+        lines.append('| %s | %d | %d | %s | %s–%s | %.1f%% | %.1f%% | %s | %s |' % (
+            g['workload'], g['client_cores'], g['threads'], value(g['qps_median']),
+            value(g['qps_min']), value(g['qps_max']), g['redis_cpu_pct_median'],
+            g['client_pool_util_pct_median'], value(g['read_p99_us_median'], 0), value(g['update_p99_us_median'], 0)))
+    lines += ['', '## Interpretation limits', '',
+              'These are observed rates for the pinned versions, data, CPU/NUMA placement and '
+              'existing host frequency policy. Three repetitions show run-to-run variation but '
+              'do not establish a universal Redis limit. Logical YCSB operations and Redis '
+              'command counts differ; the observer also issues a small number of INFO commands. '
+              'No sampled/ARM comparison was included in this baseline.', '']
+    if data['new_kernel_messages']:
+        lines += ['New kernel messages are preserved below. The campaign did not start perf '
+                  'profiling. No crash/OOM/lockup diagnostics were found.', '', '```text']
+        lines += data['new_kernel_messages'] + ['```', '']
+    (out / 'redis-ycsb-report.md').write_text('\n'.join(lines))
 
 
 def plots(root, out, data):
@@ -152,7 +289,7 @@ def plots(root, out, data):
     ticks = sorted({g['threads'] for g in data['groups'] if g['client_cores'] == 8})
     axes[0].set_xticks(ticks)
     axes[0].xaxis.set_major_formatter(ScalarFormatter())
-    axes[0].set(xlabel='YCSB workers · JVM on CPUs26–33', ylabel='Thousand successful operations/s', ylim=(0, None))
+    axes[0].set(xlabel='YCSB workers · JVM on CPUs 26–33', ylabel='Thousand successful operations/s', ylim=(0, None))
     axes[0].legend(fontsize=9)
     axes[0].grid(axis='y', alpha=.2)
     for i, p in enumerate(data['peaks']):
@@ -190,6 +327,8 @@ def plots(root, out, data):
     finish(fig, 'redis-ycsb-cpu-latency')
 
     fig, axes = plt.subplots(3, 2, figsize=(12, 9), sharex=True)
+    qps_upper = max(p['qps_max'] for p in data['peaks']) / 1000 * 1.15
+    memory_upper = max(max(r['redis_alloc_max'], r['redis_rss_peak']) for r in data['runs']) / GIB * 1.1
     for i, peak in enumerate(data['peaks']):
         run = root / 'runs' / peak['representative_run']
         row = next(r for r in data['runs'] if r['run'] == run.name)
@@ -204,19 +343,22 @@ def plots(root, out, data):
                 stat.append((dt, int(m.group(3))))
         ts, qs = [], []
         for a, b in zip(stat, stat[1:]):
-            if b[0] > a[0]:
+            # The final JVM status can cover a partial shutdown interval.
+            # Show warm-up and the full measured window; keep shutdown in raw logs.
+            if b[0] > a[0] and b[0] <= row['window_end']['epoch']:
                 ts.append(b[0]-t0);qs.append((b[1]-a[1])/(b[0]-a[0])/1000)
         axes[i,0].plot(ts, qs, color=colors[peak['workload']], lw=1.2)
         axes[i,0].axhline(peak['qps_median']/1000, color='#333333', ls=':', lw=1)
         axes[i,0].set(ylabel='Thousand ops/s', title='%s · %d workers' % (labels[peak['workload']], peak['threads']))
-        axes[i,0].set_ylim(0,None)
+        axes[i,0].set_ylim(0,qps_upper)
         axes[i,1].plot([x['epoch']-t0 for x in obs], [x['info']['used_memory']/GIB for x in obs], label='Redis allocation', color=colors[peak['workload']])
         axes[i,1].plot([x['epoch']-t0 for x in obs], [x['redis']['rss_bytes']/GIB for x in obs], label='Redis RSS', color='#333333', ls='--')
-        axes[i,1].set(ylabel='GiB', title='Redis memory', ylim=(0, None))
+        axes[i,1].set(ylabel='GiB', title='Redis memory', ylim=(0, memory_upper))
         for ax in axes[i]:
             ax.axvspan(0,30,color='#dddddd',alpha=.5)
             ax.axvline(150,color='#999999',ls=':',lw=1)
-            ax.set_xlim(0,153)
+            ax.set_xlim(0,150)
+            ax.set_xticks([0,30,60,90,120,150])
             ax.grid(axis='y',alpha=.2)
     axes[0,1].legend(fontsize=9)
     axes[-1,0].set_xlabel('Seconds · shaded first 30 s excluded')
@@ -233,6 +375,7 @@ def main():
     ap.add_argument('--plots', action='store_true')
     args = ap.parse_args()
     data = summarize(args.campaign, args.output)
+    report(args.output, data)
     if args.plots:
         plots(args.campaign, args.output, data)
     print(json.dumps({'runs': data['verified_runs'], 'files': data['verified_evidence_files'], 'peaks': data['peaks']}, indent=2))
