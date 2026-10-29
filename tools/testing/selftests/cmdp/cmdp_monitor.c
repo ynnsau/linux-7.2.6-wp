@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/cmdp.h>
+#include "snapshot_control.h"
 #ifndef SYS_pidfd_open
 #if defined(__x86_64__)
 #define SYS_pidfd_open 434
@@ -279,6 +280,20 @@ static int progress_read(int fd)
 	       p.write_calls, p.write_ns, p.write_max_ns);
 	return 0;
 }
+/* Boundary groups are ordered on this controller thread, before STOP. */
+static int boundary_snapshot(const char *label, void *arg)
+{
+	int fd = *(int *)arg;
+	struct cmdp_monitor_status s;
+	snapshot_boundary("boundary_begin", label, true);
+	int ret = status_read(fd, &s, "boundary_status");
+	if (!ret) ret = progress_read(fd);
+	int saved = errno;
+	snapshot_boundary("boundary_end", label, !ret);
+	errno = saved;
+	return ret;
+}
+
 static void cohorts(int fd, uint64_t from, uint64_t to, const char *event)
 {
 	for (uint64_t id = from; id <= to; id++) {
@@ -452,6 +467,7 @@ static void usage(const char *name)
 		"  --dirty-batch-pages N  dirty reset ceiling, 1..65536 (default 64)\n"
 		"  --wp-batch-pages N     ARM ceiling, 1..65536 (default 64)\n"
 		"  --poll-ms N       reporting interval (default 1000)\n"
+		"  --control-fd FD   accept snapshot LABEL\\n commands on inherited readable FD\n"
 		"JSONL goes to stdout; launched target stdout/stderr goes to stderr.\n"
 		"Launch disables THP before exec. Attach never changes target policy.\n"
 		"On a normal limit, monitoring stops and a launched target is allowed to finish.\n", name, name);
@@ -471,6 +487,7 @@ int main(int argc, char **argv)
 		{ "quiet-ms", 1, 0, 'Q' },
 		{ "dirty-batch-pages", 1, 0, 'D' },
 		{ "wp-batch-pages", 1, 0, 'W' },
+		{ "control-fd", 1, 0, 'F' },
 		{ "poll-ms", 1, 0, 'P' }, { "help", 0, 0, 'h' }, { 0 }
 	};
 	struct cmdp_monitor_attach a;
@@ -485,6 +502,8 @@ int main(int argc, char **argv)
 	bool own = false, once = false, attached = false, quiet_set = false;
 	bool monitor_off = false, measuring = false, batch_set = false;
 	bool target_cpus_set = false;
+	int control_fd = -1;
+	struct snapshot_control control = { .fd = -1 };
 	cpu_set_t target_cpus;
 	pthread_t measure_thread;
 	struct target_measurement measurement = { 0 };
@@ -538,6 +557,9 @@ int main(int argc, char **argv)
 		case 'm': a.max_pages = number(optarg, UINT32_MAX); break;
 		case 'H': a.max_history = number(optarg, UINT32_MAX); break;
 		case 'P': poll_ms = number(optarg, 60000); break;
+		case 'F':
+			if (control_fd >= 0) { fprintf(stderr, "repeated --control-fd\n"); return 2; }
+			control_fd = number(optarg, INT_MAX); break;
 		case 'h': usage(argv[0]); return 0;
 		default: usage(argv[0]); return 2;
 		}
@@ -545,10 +567,14 @@ int main(int argc, char **argv)
 	if (!poll_ms || (pid && (optind != argc || target_cpus_set)) || (!pid && optind == argc) ||
 	    (!batch_config.dirty_batch_pages || !batch_config.wp_batch_pages) ||
 	    (monitor_off && (pid || dirty_mode || quiet_set || batch_set || scanner_cpu_set || a.flags || once || limit || seconds)) ||
+	    ((once || monitor_off) && control_fd >= 0) ||
 	    (once && cpu_config.cpu != CMDP_MON_CPU_AUTO) ||
 	    (dirty_mode && (a.flags & CMDP_MONITOR_F_SCAN_ONLY)) ||
 	    (quiet_set && (!dirty_mode || dirty_config.quiet_ms < 10))) {
 		usage(argv[0]); return 2;
+	}
+	if (control_fd >= 0 && snapshot_control_open(&control, control_fd)) {
+		perror("control fd"); return 2;
 	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	struct sigaction sa = { .sa_handler = on_signal };
@@ -620,10 +646,26 @@ int main(int argc, char **argv)
 		if (once || interrupted || s.state == CMDP_MON_STOPPED ||
 		    (limit && seen >= limit) || (seconds && now_ns() - begin >= seconds * 1000000000ULL))
 			break;
-		struct pollfd p = { .fd = pidfd, .events = POLLIN };
-		int n = poll(&p, 1, poll_ms);
-		if (n > 0) break;
-		if (n < 0 && errno != EINTR) { perror("poll"); result = 1; break; }
+		uint64_t next_report = now_ns() + (uint64_t)poll_ms * 1000000;
+		bool target_exited = false;
+		while (!interrupted && now_ns() < next_report) {
+			struct pollfd p[2] = {
+				{ .fd = pidfd, .events = POLLIN },
+				{ .fd = control.fd, .events = POLLIN }
+			};
+			uint64_t current = now_ns();
+			int timeout = current >= next_report ? 0 :
+				(int)((next_report - current + 999999) / 1000000);
+			int n = poll(p, 2, timeout);
+			if (n < 0 && errno != EINTR) { perror("poll"); result = 1; break; }
+			if (p[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+				if (snapshot_control_read(&control, boundary_snapshot, &fd)) {
+					perror("control snapshot"); result = 1; break;
+				}
+			}
+			if (p[0].revents) { target_exited = true; break; }
+		}
+		if (result || target_exited) break;
 	}
 out:
 	if (attached) {
@@ -703,6 +745,7 @@ out:
 		       r->ru_maxrss, r->ru_minflt, r->ru_majflt, r->ru_nvcsw, r->ru_nivcsw);
 		if (child_exit) result = child_exit;
 	}
+	if (control.fd >= 0) close(control.fd);
 	if (pidfd >= 0) close(pidfd);
 	if (interrupted) result = 128 + interrupted;
 	printf("{\"event\":\"controller_exit\",\"exit_code\":%d,\"now_ns\":%" PRIu64 "}\n", result, now_ns());
