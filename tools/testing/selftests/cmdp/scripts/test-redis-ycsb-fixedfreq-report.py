@@ -152,6 +152,47 @@ class FixedFrequencyReportTest(unittest.TestCase):
         self.assertFalse(result["validation"]["passed"])
         self.assertTrue(any("Multiplexed" in error for error in result["validation"]["errors"]))
 
+    def test_fixed_policy_retains_outliers_but_cannot_claim_qualification(self):
+        rows = frequency_rows([10, 20, 29], mhz={0: 2000, 1: 2100})
+        strict = self.frequency(rows)
+        self.assertFalse(strict["validation"]["passed"])
+        self.assertTrue(strict["counter_integrity"]["passed"])
+        self.assertFalse(strict["runtime_frequency"]["passed"])
+        policy = self.frequency(rows, frequency_contract="fixed-policy")
+        self.assertTrue(policy["validation"]["passed"], policy["validation"])
+        self.assertFalse(policy["runtime_frequency"]["passed"])
+        self.assertFalse(policy["runtime_frequency"]["affects_raw_admission"])
+        self.assertFalse(policy["policy_and_qualification_verified"])
+        self.assertEqual(policy["out_of_band_intervals"], strict["out_of_band_intervals"])
+        self.assertEqual(policy["intervals"], strict["intervals"])
+        self.assertTrue(any("outside band" in warning for warning in policy["validation"]["warnings"]))
+        self.assertTrue(any("does not verify policy" in warning for warning in policy["validation"]["warnings"]))
+
+    def test_fixed_policy_still_rejects_counter_corruption(self):
+        rows = frequency_rows([10, 20, 29], mhz={0: 2000, 1: 2100})
+        rows[1]["time_running"] -= 1
+        result = self.frequency(rows, frequency_contract="fixed-policy")
+        self.assertFalse(result["counter_integrity"]["passed"])
+        self.assertFalse(result["validation"]["passed"])
+
+    def test_nominal_hardware_base_is_independent_of_lower_policy_target(self):
+        rows = frequency_rows([10, 20, 29], mhz={0: 2000, 1: 2000})
+        # Deliberately distinguish measured TSC from hardware nominal base.
+        for row in rows:
+            if row.get("event") == "frequency":
+                row["tsc"] = round(row["tsc"] * 2095 / 2100)
+        write_jsonl(self.path, rows)
+        result = REPORT.analyze_frequency(self.path, 10 * REPORT.NSEC, 30 * REPORT.NSEC,
+                                         2000000, [0, 1], nominal_base_khz=2100000)
+        self.assertTrue(result["validation"]["passed"], result["validation"])
+        for interval in result["intervals"]:
+            self.assertAlmostEqual(interval["busy_mhz"], 2000)
+            self.assertAlmostEqual(interval["tsc_mhz"], 2095)
+            self.assertAlmostEqual(interval["measured_tsc_busy_mhz"], 2095 * 2000 / 2100)
+            self.assertAlmostEqual(interval["busy_fraction"], 2100 / 2095)
+        self.assertEqual(result["selected_khz"], 2000000)
+        self.assertEqual(result["nominal_base_khz"], 2100000)
+
     def make_run(self, path, mode="arm"):
         path.mkdir()
         start, end = 10, 30
@@ -159,7 +200,7 @@ class FixedFrequencyReportTest(unittest.TestCase):
                     "start_ms": 10000, "end_ms": 30000}
         manifest = {"workload": "B", "mode": mode, "workers": 8, "target_qps": 70000,
                     "selected_khz": 2100000, "telemetry": True,
-                    "policy": {"governors": {"0": "performance", "1": "performance"}}}
+                    "policy": {"boot_id": "fixture-boot", "governors": {"0": "performance", "1": "performance"}}}
         capture = {"frequency_telemetry": True}
         counters = {"mode": mode, "first_arms": 5, "rearms": 2, "arm_events": 7,
                     "wp_events": 3, "passes_completed": 2,
@@ -195,6 +236,19 @@ class FixedFrequencyReportTest(unittest.TestCase):
                     labels={10: "measurement_start", 30: "measurement_end"}))
         return path
 
+    def add_fixed_policy_evidence(self, path):
+        manifest = REPORT.read_json(path / "run.json")
+        manifest.update({"frequency_contract": "fixed-policy", "nominal_base_khz": 2100000})
+        REPORT.save(path / "run.json", manifest)
+        capture = REPORT.read_json(path / "capture-summary.json")
+        capture.update({"selected_khz": 2100000, "frequency_policy_verified_start": True,
+                        "frequency_policy_verified_end": True})
+        REPORT.save(path / "capture-summary.json", capture)
+        profile = {"status": "qualified_locked", "selected_khz": 2100000, "boot_id": "fixture-boot",
+                   "attempts": [{"status": "passed", "selected_khz": 2100000, "seconds": 1800,
+                                 "failed_cpus": [], "per_cpu": {"0": {}, "1": {}}}]}
+        REPORT.save(path / "frequency-profile.json", profile)
+
     def test_run_exact_kernel_exposure_hook_scope_and_sampled_cpu(self):
         path = self.make_run(self.directory / "B-arm-r1")
         result = REPORT.report_run(path)
@@ -217,6 +271,41 @@ class FixedFrequencyReportTest(unittest.TestCase):
         result = REPORT.report_run(path)
         self.assertFalse(result["validation"]["passed"])
         self.assertTrue(any("flush accounting" in error for error in result["validation"]["errors"]))
+
+    def test_fixed_policy_run_requires_qualification_and_policy_attestations(self):
+        path = self.make_run(self.directory / "B-arm-r1")
+        self.add_fixed_policy_evidence(path)
+        write_jsonl(path / "frequency.jsonl", frequency_rows([0, 10, 20, 30, 40],
+                    labels={10: "measurement_start", 30: "measurement_end"}, mhz={0: 2000, 1: 2100}))
+        result = REPORT.report_run(path)
+        self.assertTrue(result["validation"]["passed"], result["validation"])
+        self.assertTrue(result["frequency_contract_evidence"]["validation"]["passed"])
+        self.assertFalse(result["frequency"]["runtime_frequency"]["passed"])
+        self.assertEqual(result["frequency_contract_evidence"]["loaded_qualification"]["seconds"], 1800)
+        (path / "frequency-profile.json").unlink()
+        result = REPORT.report_run(path)
+        self.assertFalse(result["validation"]["passed"])
+        self.assertTrue(any("lacks copied frequency-profile" in error for error in result["validation"]["errors"]))
+
+    def test_fixed_policy_rejects_wrong_boot_short_profile_or_missing_attestation(self):
+        path = self.make_run(self.directory / "B-arm-r1")
+        self.add_fixed_policy_evidence(path)
+        original = REPORT.read_json(path / "frequency-profile.json")
+        profile = copy.deepcopy(original)
+        profile["boot_id"] = "different-boot"
+        REPORT.save(path / "frequency-profile.json", profile)
+        self.assertFalse(REPORT.report_run(path)["validation"]["passed"])
+        profile = copy.deepcopy(original)
+        profile["attempts"][0]["seconds"] = 1799
+        REPORT.save(path / "frequency-profile.json", profile)
+        self.assertFalse(REPORT.report_run(path)["validation"]["passed"])
+        REPORT.save(path / "frequency-profile.json", original)
+        capture = REPORT.read_json(path / "capture-summary.json")
+        capture["frequency_policy_verified_end"] = False
+        REPORT.save(path / "capture-summary.json", capture)
+        result = REPORT.report_run(path)
+        self.assertFalse(result["validation"]["passed"])
+        self.assertTrue(any("verified_end" in error for error in result["validation"]["errors"]))
 
     def test_campaign_retains_invalid_attempt_and_requires_three_valid_repetitions(self):
         path = self.make_run(self.directory / "B-arm-r1")

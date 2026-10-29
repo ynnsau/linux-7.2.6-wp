@@ -3,6 +3,15 @@
 
 Standard library only for analysis. --plots imports matplotlib only when asked.
 No experiment, process, frequency-policy, or raw-evidence mutations are made.
+
+locked-clock is the default: integrity plus eligible runtime frequency bands
+decide admission. fixed-policy keeps runtime deviations as diagnostics; the
+raw frequency command verifies counters only, never policy or qualification.
+A fixed-policy run report additionally requires start/end policy attestations
+and a copied, matching, >=1800-second all-core qualification profile.
+
+--nominal-base-khz is the hardware reference for APERF/MPERF, independent of the
+selected policy target. Omit it to preserve the legacy measured-TSC reference.
 """
 import argparse
 import collections
@@ -80,13 +89,19 @@ def spread(values):
 def analyze_frequency(path, start_ns, end_ns, selected_khz, expected_cpus=None,
                       min_busy_fraction=0.05, tolerance_fraction=0.01,
                       required_good_fraction=0.99, require_boundary_labels=False,
-                      min_interval_seconds=1.0):
+                      min_interval_seconds=1.0, frequency_contract="locked-clock",
+                      nominal_base_khz=None):
     if end_ns <= start_ns or selected_khz <= 0:
         raise ValueError("invalid frequency window or target")
     if min_interval_seconds <= 0:
         raise ValueError("minimum frequency interval must be positive")
+    if frequency_contract not in ("locked-clock", "fixed-policy"):
+        raise ValueError("invalid frequency contract")
+    if nominal_base_khz is not None and nominal_base_khz <= 0:
+        raise ValueError("nominal hardware base frequency must be positive")
     rows = list(read_jsonl(path))
     errors = []
+    runtime_errors = []
     warnings = []
     configs = [row for row in rows if row.get("event") == "frequency_config"]
     if len(configs) != 1:
@@ -180,8 +195,10 @@ def analyze_frequency(path, start_ns, end_ns, selected_khz, expected_cpus=None,
                 invalid += 1
                 continue
             busy = delta["mperf"] / delta["tsc"]
-            mhz = (delta["tsc"] / dt) * (delta["aperf"] / delta["mperf"]) / 1e6 \
-                if delta["mperf"] else None
+            measured_tsc_mhz = delta["tsc"] / dt / 1e6
+            ratio = delta["aperf"] / delta["mperf"] if delta["mperf"] else None
+            reference_mhz = nominal_base_khz / 1000 if nominal_base_khz is not None else measured_tsc_mhz
+            mhz = reference_mhz * ratio if ratio is not None else None
             long_enough = dt >= min_interval_seconds
             eligible = long_enough and busy >= min_busy_fraction and mhz is not None
             observed_in_band = abs(mhz / target_mhz - 1) <= tolerance_fraction if mhz is not None else None
@@ -198,7 +215,8 @@ def analyze_frequency(path, start_ns, end_ns, selected_khz, expected_cpus=None,
                         "start_ns": a, "end_ns": z, "seconds": dt,
                         "relative_end_seconds": (z - start_ns) / NSEC,
                         "busy_fraction": busy, "busy_mhz": mhz,
-                        "tsc_mhz": delta["tsc"] / dt / 1e6,
+                        "tsc_mhz": measured_tsc_mhz, "aperf_mperf_ratio": ratio,
+                        "measured_tsc_busy_mhz": measured_tsc_mhz * ratio if ratio is not None else None,
                         "eligible": eligible, "in_band": in_band,
                         "observed_in_band": observed_in_band,
                         "short_interval": not long_enough,
@@ -214,8 +232,8 @@ def analyze_frequency(path, start_ns, end_ns, selected_khz, expected_cpus=None,
         bad_duration = sum(row["seconds"] for row in bad)
         frequency_good = good_fraction is None or good_fraction >= required_good_fraction
         if not frequency_good:
-            errors.append("CPU%d frequency outside band in %d/%d eligible intervals" %
-                          (cpu, len(bad), len(eligible)))
+            runtime_errors.append("CPU%d frequency outside band in %d/%d eligible intervals" %
+                                  (cpu, len(bad), len(eligible)))
         if not intervals:
             errors.append("CPU%d has no valid intervals inside measurement window" % cpu)
         cpu_reports[str(cpu)] = {
@@ -239,12 +257,23 @@ def analyze_frequency(path, start_ns, end_ns, selected_khz, expected_cpus=None,
         }
     unexercised = [int(cpu) for cpu, report in cpu_reports.items() if not report["eligible_intervals"]]
     if unexercised:
-        warnings.append("No eligible busy intervals on CPUs %s; all-core qualification supplies their loaded evidence" %
+        warnings.append("No eligible busy intervals on CPUs %s; this raw file supplies no loaded-frequency evidence for those CPUs" %
                         ",".join(map(str, unexercised)))
-    errors = list(dict.fromkeys(errors))
+    integrity_errors = list(dict.fromkeys(errors))
+    runtime_errors = list(dict.fromkeys(runtime_errors))
+    errors = integrity_errors + (runtime_errors if frequency_contract == "locked-clock" else [])
+    eligible_count = sum(row["eligible_intervals"] for row in cpu_reports.values())
+    if frequency_contract == "fixed-policy":
+        warnings += runtime_errors
+        warnings.append("Fixed-policy raw-counter assessment does not verify policy settings or loaded qualification; a run report must verify that evidence separately")
     return {"schema_version": 1, "input": digest(path), "selected_khz": selected_khz,
+            "frequency_contract": frequency_contract, "nominal_base_khz": nominal_base_khz,
             "window_ns": [start_ns, end_ns], "expected_cpus": expected_cpus,
-            "method": {"busy_mhz": "delta_TSC / delta_midpoint_time_seconds * delta_APERF / delta_MPERF / 1e6",
+            "method": {"busy_mhz": "nominal_base_khz / 1000 * delta_APERF / delta_MPERF"
+                       if nominal_base_khz is not None else
+                       "delta_TSC / delta_midpoint_time_seconds * delta_APERF / delta_MPERF / 1e6",
+                       "frequency_reference": "nominal hardware base" if nominal_base_khz is not None else "measured TSC rate",
+                       "selected_policy_target_is_not_used_as_hardware_base": True,
                        "busy_fraction": "delta_MPERF / delta_TSC", "minimum_busy_fraction": min_busy_fraction,
                        "minimum_interval_seconds": min_interval_seconds,
                        "short_intervals_retained_but_excluded_from_stability_decision": True,
@@ -254,10 +283,61 @@ def analyze_frequency(path, start_ns, end_ns, selected_khz, expected_cpus=None,
                        "idle_intervals_are_not_frequency_failures": True,
                        "counter_multiplexing_allowed": False},
             "validation": {"passed": not errors, "errors": errors, "warnings": warnings},
+            "counter_integrity": {"passed": not integrity_errors, "errors": integrity_errors},
+            "runtime_frequency": {"assessed": eligible_count > 0,
+                                  "passed": not runtime_errors if eligible_count else None,
+                                  "errors": runtime_errors,
+                                  "affects_raw_admission": frequency_contract == "locked-clock"},
+            "policy_and_qualification_verified": False,
+            "admission_scope": "Raw counter integrity and the selected runtime contract only; policy and qualification require separate run evidence",
             "cpus": cpu_reports, "intervals": all_intervals,
             "short_intervals": sum(row["short_intervals"] for row in cpu_reports.values()),
-            "eligible_intervals": sum(row["eligible_intervals"] for row in cpu_reports.values()),
+            "eligible_intervals": eligible_count,
             "out_of_band_intervals": sum(row["out_of_band_intervals"] for row in cpu_reports.values())}
+
+
+def verify_fixed_policy_evidence(directory, manifest, capture, expected_cpus):
+    """Validate persisted policy attestations and the full loaded profile."""
+    errors = []
+    for field in ("frequency_policy_verified_start", "frequency_policy_verified_end"):
+        if capture.get(field) is not True:
+            errors.append("Fixed-policy run lacks a true " + field + " attestation")
+    if capture.get("selected_khz") != manifest.get("selected_khz"):
+        errors.append("Capture and run selected frequencies differ or are missing")
+    profile_path = Path(directory) / "frequency-profile.json"
+    result = {"required": True, "policy_start_verified": capture.get("frequency_policy_verified_start") is True,
+              "policy_end_verified": capture.get("frequency_policy_verified_end") is True,
+              "loaded_qualification": None}
+    if not profile_path.exists():
+        errors.append("Fixed-policy run lacks copied frequency-profile.json")
+    else:
+        profile = read_json(profile_path)
+        boot_id = manifest.get("policy", {}).get("boot_id")
+        if profile.get("status") != "qualified_locked":
+            errors.append("Qualification profile status is not qualified_locked")
+        if not boot_id or profile.get("boot_id") != boot_id:
+            errors.append("Qualification profile boot ID differs from the run")
+        if profile.get("selected_khz") != manifest.get("selected_khz"):
+            errors.append("Qualification profile selected frequency differs from the run")
+        acceptable = []
+        for index, attempt in enumerate(profile.get("attempts", [])):
+            if (attempt.get("status") == "passed" and attempt.get("seconds", 0) >= 1800 and
+                    attempt.get("selected_khz") == manifest.get("selected_khz") and
+                    sorted(int(cpu) for cpu in attempt.get("per_cpu", {})) == sorted(expected_cpus) and
+                    not attempt.get("failed_cpus")):
+                acceptable.append((index, attempt))
+        if not acceptable:
+            errors.append("Qualification lacks a matching passed >=1800-second attempt covering all expected CPUs")
+        chosen = acceptable[-1] if acceptable else None
+        result["loaded_qualification"] = {
+            "source": digest(profile_path), "profile_status": profile.get("status"),
+            "boot_id": profile.get("boot_id"), "selected_khz": profile.get("selected_khz"),
+            "passed_attempt_index": chosen[0] if chosen else None,
+            "seconds": chosen[1]["seconds"] if chosen else None,
+            "cpu_count": len(chosen[1]["per_cpu"]) if chosen else 0,
+            "scope": "Prior all-core loaded qualification, distinct from bursty runtime effective frequency"}
+    result["validation"] = {"passed": not errors, "errors": errors}
+    return result
 
 
 def process_summary(observations, process):
@@ -311,11 +391,21 @@ def report_run(directory, expected_cpus=None):
             errors.append("Negative %s CPU-time delta" % name)
     if expected_cpus is None:
         expected_cpus = [int(cpu) for cpu in manifest.get("policy", {}).get("governors", {})] or list(range(52))
+    contract = manifest.get("frequency_contract", "locked-clock")
+    if contract not in ("locked-clock", "fixed-policy"):
+        raise ValueError("Invalid run frequency_contract")
+    nominal_base_khz = manifest.get("nominal_base_khz")
+    contract_evidence = {"required": False, "validation": {"passed": True, "errors": []},
+                         "scope": "Legacy locked-clock run: runtime band admission is unchanged"}
+    if contract == "fixed-policy":
+        contract_evidence = verify_fixed_policy_evidence(directory, manifest, capture, expected_cpus)
+        errors.extend(contract_evidence["validation"]["errors"])
     frequency = None
     if capture.get("frequency_telemetry", manifest.get("telemetry", True)):
         frequency = analyze_frequency(directory / "frequency.jsonl", start_ns, end_ns,
                                       manifest["selected_khz"], expected_cpus,
-                                      require_boundary_labels=True)
+                                      require_boundary_labels=True, frequency_contract=contract,
+                                      nominal_base_khz=nominal_base_khz)
         errors.extend("Frequency: " + error for error in frequency["validation"]["errors"])
         warnings.extend(frequency["validation"]["warnings"])
     else:
@@ -396,11 +486,15 @@ def report_run(directory, expected_cpus=None):
               "frequency_eligible_intervals": frequency["eligible_intervals"] if frequency else None,
               "frequency_short_intervals": frequency["short_intervals"] if frequency else None,
               "frequency_out_of_band_intervals": frequency["out_of_band_intervals"] if frequency else None}
-    sources = ("run.json", "timeline.json", "capture-summary.json", "latency.json",
-               "counters.json", "observations.jsonl")
+    sources = ["run.json", "timeline.json", "capture-summary.json", "latency.json",
+               "counters.json", "observations.jsonl"]
+    if (directory / "frequency-profile.json").exists():
+        sources.append("frequency-profile.json")
     return {"schema_version": 1, "directory": str(directory), "run_name": directory.name,
             "workload": manifest["workload"], "mode": mode, "workers": manifest["workers"],
             "target_qps": target, "selected_khz": manifest["selected_khz"],
+            "frequency_contract": contract, "nominal_base_khz": nominal_base_khz,
+            "frequency_contract_evidence": contract_evidence,
             "timeline": timeline, "metrics": metric, "latency": latency_summary,
             "processes": processes, "arm": arm, "counters": counters,
             "frequency": frequency, "arm_time_series": arm_series,
@@ -412,7 +506,10 @@ def report_run(directory, expected_cpus=None):
                                   "WP events count write-terminated ARM generations; write-hook time is not complete page-fault time.",
                                   "Scanner flush calls and host TLB shootdown interrupts are distinct counters.",
                                   "Frequency sampling validates intervals at least 1 second long and at least 5% busy; shorter intervals remain diagnostic.",
-                                  "Idle-core loaded frequency behavior comes from the separate all-core qualification."],
+                                  "Idle-core loaded frequency behavior comes from the separate all-core qualification.",
+                                  "Fixed-policy admission verifies persisted policy and loaded qualification; bursty effective-frequency deviations remain visible diagnostics, not proof of an exact runtime clock."
+                                  if contract == "fixed-policy" else
+                                  "Locked-clock admission requires the eligible runtime frequency-band check to pass."],
             "sources": {name: digest(directory / name) for name in sources},
             "validation": {"passed": not errors, "errors": list(dict.fromkeys(errors)),
                            "warnings": list(dict.fromkeys(warnings))}}
@@ -453,10 +550,11 @@ def aggregate_campaign(directory, expected_repetitions=3):
     if len(reports) != len(WORKLOADS) * len(MODES) * expected_repetitions:
         errors.append("Campaign has %d report files, expected %d" %
                       (len(reports), len(WORKLOADS) * len(MODES) * expected_repetitions))
-    configurations = {(report["workers"], report["target_qps"], report["selected_khz"])
+    configurations = {(report["workers"], report["target_qps"], report["selected_khz"],
+                       report.get("frequency_contract", "locked-clock"), report.get("nominal_base_khz"))
                       for report in reports}
     if len(configurations) != 1:
-        errors.append("Campaign reports do not share one worker/target/frequency configuration")
+        errors.append("Campaign reports do not share one worker/target/frequency/contract/reference configuration")
     return {"schema_version": 1, "directory": str(directory),
             "expected_repetitions": expected_repetitions,
             "aggregation": "Median and min/max of per-run values; no averaging of percentile populations",
@@ -469,10 +567,15 @@ def number(value, decimals=2):
 
 
 def markdown_report(campaign):
-    lines = ["# Fixed-frequency Redis/YCSB results", "",
+    contracts = sorted(set(report.get("frequency_contract", "locked-clock") for report in campaign["runs"]))
+    title = "Redis/YCSB under fixed frequency policy" if contracts == ["fixed-policy"] else "Fixed-frequency Redis/YCSB results"
+    lines = ["# " + title, "",
              "Eight workers, a 70,000 QPS aggregate target, 20 seconds excluded, then 600 seconds measured.",
              "Each summary is the median of the valid repetitions; individual runs and ranges remain in the JSON.", "",
              "Validation: **%s**." % ("passed" if campaign["validation"]["passed"] else "incomplete or failed")]
+    if contracts == ["fixed-policy"]:
+        lines += ["", "The configured frequency policy and a matching all-core loaded qualification were verified for admitted runs. "
+                  "Bursty runtime effective frequency is reported separately and may differ from the policy target; this result does not claim an exact clock on every active interval."]
     if campaign["validation"]["errors"]:
         lines += ["", "Validation findings:", ""] + ["- " + error for error in campaign["validation"]["errors"]]
     lines += ["", "| Workload | Mode | Runs | QPS | Shortfall % | Live ARM mean GiB | ARM events | WP events | Scanner flush calls | Redis TLB IPIs |",
@@ -581,6 +684,10 @@ def main():
     frequency.add_argument("--selected-khz", type=int, required=True)
     frequency.add_argument("--expected-cpus", default=None)
     frequency.add_argument("--require-boundaries", action="store_true")
+    frequency.add_argument("--frequency-contract", choices=("locked-clock", "fixed-policy"), default="locked-clock",
+                           help="fixed-policy treats runtime band deviations as diagnostic; raw counter input cannot verify policy or loaded qualification")
+    frequency.add_argument("--nominal-base-khz", type=int,
+                           help="Hardware APERF/MPERF reference, independent of selected policy target; omit for measured-TSC reference")
     frequency.add_argument("--output", type=Path, required=True)
     campaign = commands.add_parser("campaign")
     campaign.add_argument("--directory", type=Path, required=True)
@@ -597,7 +704,8 @@ def main():
         elif args.command == "frequency":
             result = analyze_frequency(args.input, args.start_ns, args.end_ns, args.selected_khz,
                 cpulist(args.expected_cpus) if args.expected_cpus else None,
-                require_boundary_labels=args.require_boundaries)
+                require_boundary_labels=args.require_boundaries,
+                frequency_contract=args.frequency_contract, nominal_base_khz=args.nominal_base_khz)
             save(args.output, result)
         else:
             result = aggregate_campaign(args.directory, args.expected_repetitions)

@@ -1,14 +1,29 @@
-# Fixed-frequency Redis/YCSB handoff
+# Redis/YCSB frequency-control handoff
 
 This campaign compares **off, dirty sampling, and dirty sampling + ARM** for
 YCSB A/B/C. Every run uses eight workers and a 70,000 logical-operations/s target,
 excludes the first 20 seconds, and measures 600 seconds. Three repetitions per
 workload/mode give 27 measured runs. Workload and mode order rotate.
 
-At initial handoff on 2026-10-29, **2.1 GHz was the candidate and its full
-30-minute all-core qualification was still running**. Consult `profile.json` and
-the status command for the current result; this document is not qualification
-evidence. The runner requires a passed 1,800-second qualification on this boot.
+**The 27-run campaign is stopped pending the frequency-contract decision.** All
+52 cores passed 30 minutes of continuous scalar load at 2.1 GHz, but the first B
+pilot failed the effective-clock check: Redis stayed near 2.1 GHz while client
+cores ran lower. Independent raw-MSR turbostat readings confirmed the variation;
+bursty scalar work reproduced it, so it is not specific to YCSB or vector code.
+The requested policies stayed fixed. Evidence is in `profile.json`,
+`pilots/B-off-smoke-v1/`, and `diagnostics/dual-reader-v1/` and `scalar-duty-v1/`.
+
+The default remains `locked-clock`; there is **no automatic relaxation**:
+
+| Frequency contract | Required behavior |
+|---|---|
+| `locked-clock` | Fixed requested policy and effective busy frequency within ±1% for at least 99% of eligible intervals per core. The current workload pilot fails this contract. |
+| `fixed-policy` | Explicit alternative: keep min/max requests and boost policy fixed, validate counter integrity, and report workload-dependent effective-clock variation without treating that variation alone as failure. |
+
+Both require the passed full-load qualification on the current boot. Further
+clock-stability work or explicit selection of the fixed-policy experiment must
+precede restarting the suite. Results from the latter must not claim perfectly
+locked effective clocks.
 
 ## Paths and fixed configuration
 
@@ -69,7 +84,7 @@ sudo "$study_root/bin/cpu-frequency" qualify --start-khz 2100000 \
 
 Qualification runs a scalar worker on every core, checks busy frequency against
 the target, and records thermal/throttle and machine-error evidence. Successful
-qualification leaves the selected clock locked for this boot. Failure restores
+qualification leaves the selected requested policy fixed for this boot. Failure restores
 the saved policy. The original state is `state.json`; attempts and turbostat
 evidence are under `qualification/`; the decision is `profile.json`.
 
@@ -83,7 +98,7 @@ sudo "$study_root/bin/cpu-frequency" restore
 `apply` alone does not qualify a frequency. Use the selected value in the profile
 if qualification chose a lower setting. Restore verifies boot/topology identity.
 There is no GRUB change, reboot, BIOS write, or boot-time persistence. Do not
-restore between compared runs; leave the validated lock after the campaign unless
+restore between compared runs; leave the verified requested policy after the campaign unless
 restoration is explicitly wanted. Frequency and experiment operations share an
 exclusive lock.
 
@@ -93,12 +108,21 @@ The supervisor runs as root to open CMD-P/per-CPU counters and launches Redis an
 Java as `yans3`. Authenticate interactively with `sudo`; never place a password
 in a script, environment file, command log, or unit.
 
-After frequency qualification, prepare the configuration and source hashes:
+After resolving the contract decision, prepare the configuration and source
+hashes. With no explicit option, `prepare` preserves a stored contract; a new
+configuration defaults to strict `locked-clock`:
 
 ```sh
 sudo python3 tools/testing/selftests/cmdp/scripts/redis-ycsb-fixedfreq.py prepare
 "$study_root/bin/redis-ycsb-campaign" status
 ```
+
+Only if the fixed-policy alternative has been explicitly selected, use
+`prepare --frequency-contract fixed-policy` instead. `prepare --frequency-contract
+locked-clock` explicitly selects strict checking. The selected contract is frozen
+in `config.json` and copied into every run. Before campaign attempts exist, a
+configuration change archives its predecessor under `config-manifests/`; after
+an attempt exists, changing the contract or refreezing changed sources is refused.
 
 The generated wrapper is `$study_root/bin/redis-ycsb-campaign`. Its `suite` action
 runs **11 pilots, followed by 27 measured runs**:
@@ -176,7 +200,9 @@ shootdown interrupts, not per-process flush instructions.
 The frequency observer stays on CPU24. Remote grouped counter reads still cause
 kernel activity/IPIs on observed cores; they are not themselves TLB shootdowns.
 Use identical collection in the compared modes and retain the collector-overhead
-pilots. Busy-frequency stability checks require intervals of at least one second
+pilots. Effective busy MHz uses the verified nominal base from `MSR_PLATFORM_INFO`
+times APERF/MPERF, matching turbostat's reference; the independently measured TSC
+rate remains diagnostic. Busy-frequency stability checks require intervals of at least one second
 and at least 5% busy time. Shorter intervals remain visible as diagnostics; close
 boundary/periodic samples can exaggerate timing noise. All-core qualification
 still uses one-second observations. These are interval averages; idle intervals

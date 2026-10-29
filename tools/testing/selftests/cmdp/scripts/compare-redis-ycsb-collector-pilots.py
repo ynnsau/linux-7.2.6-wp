@@ -84,6 +84,8 @@ def run_summary(path, expected_telemetry):
     signature = {"workload": manifest["workload"], "mode": manifest["mode"],
                  "workers": manifest["workers"], "target_qps": manifest["target_qps"],
                  "selected_khz": manifest["selected_khz"],
+                 "frequency_contract": manifest.get("frequency_contract", "locked-clock"),
+                 "nominal_base_khz": manifest.get("nominal_base_khz"),
                  "warmup_seconds": manifest["warmup_seconds"],
                  "measure_seconds": manifest["measure_seconds"],
                  "policy": manifest.get("policy"),

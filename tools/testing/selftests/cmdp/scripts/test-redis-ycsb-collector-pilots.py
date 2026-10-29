@@ -107,6 +107,17 @@ class CollectorPilotTest(unittest.TestCase):
         self.assertFalse(result["validation"]["passed"])
         self.assertEqual(result["valid_pairs"], 2)
 
+    def test_frequency_contract_and_hardware_reference_must_match(self):
+        path = self.pairs[0][1]
+        manifest = PILOTS.read(path / "run.json")
+        manifest["frequency_contract"] = "fixed-policy"
+        manifest["nominal_base_khz"] = 2100000
+        write(path / "run.json", manifest)
+        seal(path)
+        result = PILOTS.compare(self.pairs)
+        self.assertFalse(result["validation"]["passed"])
+        self.assertEqual(result["valid_pairs"], 2)
+
     def test_reusing_one_pair_cannot_impersonate_repetitions(self):
         result = PILOTS.compare([self.pairs[0]] * 3)
         self.assertFalse(result["validation"]["passed"])

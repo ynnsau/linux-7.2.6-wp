@@ -85,13 +85,26 @@ busy-frequency estimate. Initial and final labeled samples are automatic.
 `--duration-sec N` is available for short validation. SIGTERM records a final
 sample, closes every counter, and exits zero if collection succeeded.
 
-For consecutive samples of the same CPU, calculate TSC rate from the TSC delta
-and elapsed monotonic read-midpoint time. Estimated busy frequency is TSC rate
-times the APERF/MPERF delta ratio. Skip intervals with zero MPERF delta and retain
-busy-time estimates when deciding which intervals are eligible for validation.
-Compare against turbostat under the same scalar load before relying on the
-estimates for this experimental CPU. The counters measure average frequency
-over an interval, not instantaneous clock stability.
+The C collector's raw schema is unchanged by the analysis frequency reference.
+For consecutive samples of the same CPU, calculate measured TSC rate from the
+TSC delta and elapsed monotonic read-midpoint time. The reporter retains the
+legacy TSC-rate-times-APERF/MPERF estimate when no nominal reference is supplied.
+
+BMP reporting supplies an independently verified nominal base: the ratio in
+`MSR_PLATFORM_INFO` (`0xCE`, bits 15:8) is 21, giving 2,100,000 kHz with this
+platform's 100 MHz ratio unit. Busy frequency is that nominal base times the
+APERF/MPERF delta ratio, matching turbostat's reference. This base is independent
+of the selected policy frequency: selecting a lower requested frequency must
+not replace the nominal reference. Measured TSC rate remains diagnostic; busy
+fraction remains delta-MPERF divided by delta-TSC.
+
+Skip frequency estimates with zero MPERF delta. The experiment's stability
+assessment uses intervals at least one second long and at least 5% busy; shorter
+intervals remain visible as diagnostics. Compare against `turbostat --no-perf`
+for independent raw-MSR access. Continuous scalar qualification and bursty
+workloads must both be considered: a fixed requested policy does not establish
+that every workload has the same effective busy frequency. The counters measure
+an interval average, not instantaneous clock stability.
 
 ## Privileged integration check
 

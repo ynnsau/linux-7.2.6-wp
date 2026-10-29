@@ -17,6 +17,7 @@ import pathlib
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -38,7 +39,8 @@ CONFIG = {'version': 1, 'workloads': ['A', 'B', 'C'],
           'scanner_cpu': 0, 'observer_cpu': 24, 'period_ms': 10000,
           'quiet_ms': 10000, 'dirty_batch_pages': 512, 'wp_batch_pages': 512,
           'frequency_interval_ms': 11000, 'export_timeout_seconds': 1800,
-          'kernel': '7.2.6-cmdp-cpu-production', 'leave_frequency_locked': True}
+          'kernel': '7.2.6-cmdp-cpu-production', 'leave_frequency_locked': True,
+          'frequency_contract': 'locked-clock', 'nominal_base_khz': 2100000}
 
 
 def now():
@@ -110,6 +112,19 @@ def frequency_policy():
     assert P('/sys/devices/system/cpu/online').read_text().strip() == '0-51'
     assert int(P('/sys/devices/system/cpu/cpufreq/boost').read_text()) == 0
     return khz
+
+
+def frequency_reference():
+    # BMP is Intel family 6/model 85; PLATFORM_INFO's base ratio is in 100 MHz units.
+    fd = os.open('/dev/cpu/0/msr', os.O_RDONLY)
+    try:
+        value = struct.unpack('<Q', os.pread(fd, 8, 0xce))[0]
+    finally:
+        os.close(fd)
+    nominal_khz = ((value >> 8) & 0xff) * 100000
+    assert nominal_khz == CONFIG['nominal_base_khz'], 'Hardware nominal frequency changed'
+    return {'source': 'MSR_PLATFORM_INFO bits15:8 times100MHz',
+            'msr_hex': hex(value), 'nominal_base_khz': nominal_khz}
 
 
 def interrupts():
@@ -311,6 +326,8 @@ def analyze_frequency(directory, timeline, khz):
             '--start-ns', str(int(timeline['start_monotonic'] * 1e9)),
             '--end-ns', str(int(timeline['end_monotonic'] * 1e9)),
             '--selected-khz', str(khz), '--expected-cpus', '0-51', '--require-boundaries',
+            '--frequency-contract', CONFIG['frequency_contract'],
+            '--nominal-base-khz', str(CONFIG['nominal_base_khz']),
             '--output', str(directory / 'frequency-validation.json')]
     with open(str(directory / 'frequency-analysis.log'), 'w') as log:
         subprocess.check_call(argv, stdout=log, stderr=subprocess.STDOUT)
@@ -345,15 +362,19 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
     B.mkdir(directory)
     os.sched_setaffinity(0, {24})
     khz = frequency_policy()
+    reference = frequency_reference()
     assert os.uname().release == CONFIG['kernel']
     assert shutil.disk_usage(str(ROOT)).free > 12 * 1024 ** 3, 'Insufficient export disk reserve'
     before = idle_cmdp()
     policies = B.policies()
     original_thermal = thermal_counts()
     manifest = json.loads((STUDY / 'artifacts/golden/manifest.json').read_text())
+    save(directory / 'frequency-profile.json', json.loads((ROOT / 'profile.json').read_text()))
     save(directory / 'run.json', {'at': now(), 'workload': workload, 'mode': mode,
          'warmup_seconds': warm, 'measure_seconds': duration, 'target_qps': 70000,
          'workers': 8, 'selected_khz': khz, 'telemetry': telemetry,
+         'frequency_contract': CONFIG['frequency_contract'],
+         'nominal_base_khz': CONFIG['nominal_base_khz'], 'frequency_reference': reference,
          'policy': policies, 'source_hashes': selected_sources()})
     p = r = client = None
     controls = []
@@ -506,6 +527,7 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
                    'client_rss_peak': max(x['client']['rss_bytes'] for x in window),
                    'redis_used_memory_mean': sum(x['info']['used_memory'] for x in window) / len(window),
                    'cmdp_before': before, 'cmdp_after': after, 'frequency_telemetry': telemetry,
+                   'frequency_policy_verified_start': True, 'frequency_policy_verified_end': True,
                    'clock_offset_max_change_ns': clock_offset_max_change_ns,
                    'query_and_export_seconds': time.monotonic() - launched}
         save(directory / 'capture-summary.json', summary)
@@ -610,7 +632,12 @@ def prepare():
     save(ROOT / 'golden-verification.json', {'at': now(), 'sha256': golden_sha,
          'bytes': (golden / 'dump.rdb').stat().st_size, 'recordcount': golden_manifest['recordcount']})
     if (ROOT / 'config.json').exists():
-        assert json.loads((ROOT / 'config.json').read_text()) == CONFIG
+        previous_config = json.loads((ROOT / 'config.json').read_text())
+        if previous_config != CONFIG:
+            assert not any((ROOT / 'campaign-v1').iterdir()), 'Cannot change configuration over campaign evidence'
+            archive = ROOT / 'config-manifests' / (datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ') + '.json')
+            save(archive, previous_config)
+            save(ROOT / 'config.json', CONFIG)
     else:
         save(ROOT / 'config.json', CONFIG)
     hashes = selected_sources()
@@ -644,13 +671,29 @@ def main():
     p.add_argument('--no-frequency-telemetry', action='store_true')
     p.add_argument('--directory', type=P)
     p.add_argument('--jobs', type=int, default=1)
+    p.add_argument('--frequency-contract', choices=['locked-clock', 'fixed-policy'],
+                   help='prepare only: explicitly freeze strict effective clock or fixed requested policy')
     args = p.parse_args()
     load_helper()
+    if (ROOT / 'config.json').exists():
+        stored = json.loads((ROOT / 'config.json').read_text())
+        CONFIG['frequency_contract'] = stored.get('frequency_contract', 'locked-clock')
+    if args.frequency_contract:
+        if args.action != 'prepare':
+            p.error('--frequency-contract is only accepted by prepare')
+        CONFIG['frequency_contract'] = args.frequency_contract
     if args.action == 'suite':
         ROOT.mkdir(parents=True, exist_ok=True)
         with open(str(ROOT / 'suite.lock'), 'a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            suite()
+            try:
+                suite()
+            except BaseException as exc:
+                path = ROOT / 'suite-state.json'
+                previous = json.loads(path.read_text()) if path.exists() else None
+                save(path, {'at': now(), 'status': 'failed', 'last_stage': previous,
+                     'error': str(exc), 'supervisor': process_identity(os.getpid())})
+                raise
         return
     if args.action == 'status':
         captured = sorted((ROOT / 'campaign-v1').glob('*/capture-receipt.json'))
@@ -660,6 +703,8 @@ def main():
         suite_state = json.loads((ROOT / 'suite-state.json').read_text()) if (ROOT / 'suite-state.json').exists() else None
         emit('status', captured=len(captured), analyzed=len(analyzed), expected=27,
              pilots_analyzed=len(list((ROOT / 'pilots').glob('*/receipt.json'))),
+             pilot_failures=[str(x) for x in sorted((ROOT / 'pilots').glob('*/failure.json'))],
+             frequency_contract=CONFIG['frequency_contract'],
              suite=suite_state,
              frequency={'status': profile.get('status'), 'selected_khz': profile.get('selected_khz')},
              failures=[str(x) for x in failures], state=json.loads((ROOT / 'campaign-state.json').read_text())

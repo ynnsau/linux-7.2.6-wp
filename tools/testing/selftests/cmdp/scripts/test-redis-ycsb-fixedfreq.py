@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Pure runner checks plus replay of an optional real boundary-smoke trace."""
 import argparse
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -126,6 +128,79 @@ def main():
         finally:
             r.ROOT, r.os.geteuid, r.subprocess.check_call, r.emit, r.process_identity = originals
     results.append('suite schedules 11 pilots then capture/analysis; pilot failure stops subsequent stages')
+
+    with tempfile.TemporaryDirectory() as td:
+        originals = (r.ROOT, r.STUDY, r.B, r.CONFIG, r.selected_sources,
+                     r.emit, r.load_helper, r.sys.argv)
+        emitted = []
+        class PrepareHelper:
+            @staticmethod
+            def mkdir(path):
+                Path(path).mkdir(parents=True, exist_ok=True)
+            @staticmethod
+            def command(argv):
+                return 'test-source-commit'
+        try:
+            r.STUDY = Path(td)
+            r.ROOT = r.STUDY / 'fixedfreq-v1'
+            (r.ROOT / 'bin').mkdir(parents=True)
+            golden = r.STUDY / 'artifacts' / 'golden'
+            golden.mkdir(parents=True)
+            (golden / 'dump.rdb').write_bytes(b'test-golden-database')
+            (golden / 'manifest.json').write_text(json.dumps({
+                'rdb_sha256': r.sha(golden / 'dump.rdb'), 'recordcount': 1}))
+            r.B = PrepareHelper
+            r.CONFIG = dict(originals[3])
+            assert r.CONFIG['frequency_contract'] == 'locked-clock'
+            r.selected_sources = lambda: {'test-source': 'original-hash'}
+            r.emit = lambda event, **values: emitted.append((event, values))
+            r.load_helper = lambda: None
+            r.sys.argv = ['runner', 'prepare']
+            r.main()
+            config = json.loads((r.ROOT / 'config.json').read_text())
+            assert config['frequency_contract'] == 'locked-clock'
+            r.sys.argv = ['runner', 'prepare', '--frequency-contract', 'fixed-policy']
+            r.main()
+            config = json.loads((r.ROOT / 'config.json').read_text())
+            assert config['frequency_contract'] == 'fixed-policy'
+            archived = list((r.ROOT / 'config-manifests').glob('*.json'))
+            assert len(archived) == 1
+            assert json.loads(archived[0].read_text())['frequency_contract'] == 'locked-clock'
+            r.CONFIG['frequency_contract'] = 'locked-clock'
+            r.sys.argv = ['runner', 'status']
+            r.main()
+            assert emitted[-1][1]['frequency_contract'] == 'fixed-policy'
+            assert r.CONFIG['frequency_contract'] == 'fixed-policy'
+            r.sys.argv = ['runner', 'status', '--frequency-contract', 'locked-clock']
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    r.main()
+                except SystemExit as error:
+                    assert error.code == 2
+                else:
+                    raise AssertionError('contract override was accepted outside prepare')
+            (r.ROOT / 'campaign-v1' / 'A-off-r1').mkdir()
+            r.sys.argv = ['runner', 'prepare', '--frequency-contract', 'locked-clock']
+            try:
+                r.main()
+            except AssertionError as error:
+                assert 'Cannot change configuration over campaign evidence' in str(error)
+            else:
+                raise AssertionError('contract was changed over campaign evidence')
+            assert json.loads((r.ROOT / 'config.json').read_text())['frequency_contract'] == 'fixed-policy'
+            r.selected_sources = lambda: {'test-source': 'changed-hash'}
+            r.sys.argv = ['runner', 'prepare', '--frequency-contract', 'fixed-policy']
+            try:
+                r.main()
+            except AssertionError as error:
+                assert 'Cannot refreeze modified sources over campaign evidence' in str(error)
+            else:
+                raise AssertionError('sources were refrozen over campaign evidence')
+            assert json.loads((r.ROOT / 'source-manifest.json').read_text())['hashes'] == {'test-source': 'original-hash'}
+        finally:
+            (r.ROOT, r.STUDY, r.B, r.CONFIG, r.selected_sources,
+             r.emit, r.load_helper, r.sys.argv) = originals
+    results.append('strict contract default, explicit pre-campaign selection/archive, persisted selection, post-start changes refused')
 
     if args.boundary_smoke:
         rows = [json.loads(s) for s in (args.boundary_smoke / 'monitor.jsonl').read_text().splitlines()]
