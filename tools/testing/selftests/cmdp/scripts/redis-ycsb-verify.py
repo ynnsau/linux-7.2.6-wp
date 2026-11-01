@@ -50,14 +50,55 @@ def monitoring_summary(rows, mode, used_memory):
     require(statuses, 'Missing monitor status evidence')
     require(all(row['resource_failures'] == row['reports_dropped'] == 0
                 for row in statuses), 'Monitor lost resources or reports')
-    cohorts = [row for row in rows if row.get('event') in ('sweep', 'cohort_snapshot')]
+    require(all(row['terminals'].get('error', -1) == 0 for row in statuses),
+            'Monitor reported an error terminal')
+    final = [row for row in statuses if row.get('event') == 'final']
+    require(len(final) == 1 and final[0]['active'] == 0 and
+            final[0]['state'] == 4 and final[0]['stop_reason'] == 'control_stop',
+            'Missing clean final control-stop status')
+    stop_requests = [row for row in rows if row.get('event') == 'stop_request']
+    stop_returns = [row for row in rows if row.get('event') == 'stop_return']
+    exits = [row for row in rows if row.get('event') == 'controller_exit']
+    require(len(stop_requests) == len(stop_returns) == len(exits) == 1,
+            'Missing or ambiguous controller STOP evidence')
+    stop_ns = stop_requests[0]['now_ns']
+    stop_return_ns = stop_returns[0]['now_ns']
+    require(stop_ns > 0 and stop_return_ns >= stop_ns and stop_returns[0]['errno'] == 0
+            and exits[0]['exit_code'] == 143 and exits[0]['now_ns'] >= stop_return_ns,
+            'Controller STOP/exit failed')
+    cohorts = [row for row in rows if row.get('event') in
+               ('sweep', 'cohort_snapshot', 'cohort_observation_end', 'cohort_final')]
     require(cohorts, 'Missing monitor cohort evidence')
-    require(all(row['error'] == 0 for row in cohorts), 'Monitor reported a scan error')
+    require(not any(row.get('event') == 'cohort_missing' for row in rows),
+            'Monitor reported a missing cohort')
+    last_pass_id = max(row['pass_id'] for row in cohorts)
+    interrupted = set()
+    for row in cohorts:
+        if row['error'] == 0:
+            continue
+        # STOP can interrupt the last in-flight scan with -ESHUTDOWN. It is
+        # never a completed coverage scan, and is accepted only with clean
+        # STOP/exit evidence and timestamps placing its end after the request.
+        require(row['error'] == -108 and row['complete'] == 0 and
+                row['pass_id'] == last_pass_id == final[0].get('passes_started') and
+                0 < row.get('start_ns', 0) <= stop_ns <=
+                row.get('end_ns', 0) <= stop_return_ns and
+                row.get('observed_ns', 0) >= stop_ns,
+                'Monitor reported a scan error outside expected STOP interruption')
+        interrupted.add(row['pass_id'])
+    for pass_id in interrupted:
+        terminal = [row for row in cohorts if row.get('event') == 'cohort_final'
+                    and row['pass_id'] == pass_id]
+        require(len(terminal) == 1 and terminal[0]['error'] == -108 and
+                terminal[0]['complete'] == 0,
+                'Missing final evidence for STOP-interrupted scan')
+        require(not any(row['complete'] for row in cohorts if row['pass_id'] == pass_id),
+                'STOP-interrupted scan was also reported complete')
     require(all(row['skips']['thp_policy'] == 0 for row in cohorts),
             'THP policy exclusions returned during workload')
     require(all(row['skips'].get('resource', 0) == 0 for row in cohorts),
             'Monitor cohort reported resource exclusions')
-    completed = [row for row in cohorts if row['complete']]
+    completed = [row for row in cohorts if row['complete'] and row['error'] == 0]
     require(completed, 'No complete workload scan')
     eligible_bytes = max(row['eligible_pages'] for row in completed) * PAGE
     require(eligible_bytes >= .9 * used_memory,
@@ -73,9 +114,6 @@ def monitoring_summary(rows, mode, used_memory):
     rearms = max(row['rearms'] for row in statuses)
     wp_events = max(row['terminals']['write'] for row in statuses)
     live_peak_pages = max(row['active'] for row in statuses)
-    final = [row for row in statuses if row.get('event') == 'final']
-    require(len(final) == 1 and final[0]['active'] == 0,
-            'Missing clean final status')
     if mode == 'sampling':
         require(first_arms == rearms == wp_events == live_peak_pages == 0,
                 'Sampling-only check performed ARM or WP')
@@ -95,6 +133,8 @@ def monitoring_summary(rows, mode, used_memory):
             'dirty_pages_reset_total': max(row['dirty_pages'] for row in batches),
             'wp_pages_protected_total': max(row['wp_pages'] for row in batches),
             'complete_pass_ids': sorted(set(row['pass_id'] for row in completed)),
+            'interrupted_pass_ids': sorted(interrupted),
+            'stop_request_ns': stop_ns,
             'arm_coverage_requirement': 'reported; no workload minimum'}
 
 

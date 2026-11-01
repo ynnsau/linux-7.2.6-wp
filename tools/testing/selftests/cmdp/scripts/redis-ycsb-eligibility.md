@@ -19,7 +19,7 @@ From the repository, with the existing qualified 2.1 GHz policy still applied:
 
 ```sh
 sudo python3 tools/testing/selftests/cmdp/scripts/redis-ycsb-fixedfreq.py verify-eligibility \
-  --output-root /home/yans3/cmdp-v2/redis-ycsb-study/eligibility-v1 \
+  --output-root /home/yans3/cmdp-v2/redis-ycsb-study/eligibility-v2 \
   --frequency-profile-root /home/yans3/cmdp-v2/redis-ycsb-study/fixedfreq-v1 \
   --frequency-contract fixed-policy --target-qps 50000
 ```
@@ -52,3 +52,10 @@ Review `verify-state.json`, `verify-summary.json`, `idle-arm-v1/`, and `smoke-v1
 A failure stops the sequence and preserves its evidence. This is one functional
 check per mode, not a three-repetition latency comparison. No kernel rebuild,
 GRUB edit, reboot, global THP update or frequency-policy update is involved.
+
+A timed STOP may cancel the last unfinished scan with `-ESHUTDOWN`. The summary
+accepts only that incomplete final pass, with timestamps after STOP and clean
+STOP/exit/ownership evidence; it never counts it as completed coverage. Other
+scan errors remain failures. The first verification attempt is preserved in
+`eligibility-v1` because the initial summary incorrectly rejected this normal
+STOP cancellation.
