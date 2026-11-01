@@ -261,7 +261,7 @@ def validate_db(r, count, samples=None):
     return {'info': info, 'samples': current}
 
 
-def start_redis(directory, database):
+def start_redis(directory, database, exec_prefix=None):
     mkdir(directory)
     mkdir(database)
     config = '\n'.join(['bind 127.0.0.1', 'protected-mode yes', 'port %d' % PORT,
@@ -278,37 +278,79 @@ def start_redis(directory, database):
     except ConnectionRefusedError:
         pass
     t0 = time.monotonic()
-    p = spawn([REDIS, directory / 'redis.conf'], directory, directory / 'redis.log', '1', 0)
-    for _ in range(1800):
-        if p.poll() is not None:
-            raise RuntimeError('Redis failed: ' + (directory / 'redis.log').read_text()[-2000:])
-        try:
-            r = Redis(5)
-            info = r.info('server', 'persistence')
-            if info['loading'] == 0:
-                assert info['process_id'] == p.pid
-                assert r.call('PING') == 'PONG'
-                affinity(p.pid, [1])
-                return p, r, time.monotonic() - t0
+    argv = list(exec_prefix or []) + [REDIS, directory / 'redis.conf']
+    p = spawn(argv, directory, directory / 'redis.log', '1', 0)
+    r = None
+    try:
+        for _ in range(1800):
+            if p.poll() is not None:
+                raise RuntimeError('Redis failed: ' + (directory / 'redis.log').read_text()[-2000:])
+            try:
+                r = Redis(5)
+                info = r.info('server', 'persistence')
+                if info['loading'] == 0:
+                    assert info['process_id'] == p.pid
+                    assert r.call('PING') == 'PONG'
+                    affinity(p.pid, [1])
+                    return p, r, time.monotonic() - t0
+                r.close()
+                r = None
+            except (ConnectionRefusedError, RuntimeError, socket.timeout):
+                if r is not None:
+                    r.close()
+                    r = None
+            time.sleep(0.2)
+        raise RuntimeError('Redis restore exceeded six minutes')
+    except BaseException:
+        if r is not None:
             r.close()
-        except (ConnectionRefusedError, RuntimeError, socket.timeout):
-            pass
-        time.sleep(0.2)
-    p.terminate()
-    p.wait(timeout=30)
-    raise RuntimeError('Redis restore exceeded six minutes')
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        raise
 
 
 def stop_redis(p, r):
-    if p.poll() is None:
-        try:
+    """Stop only our unreaped child, including when its Redis socket is broken."""
+    error = None
+    try:
+        if p.poll() is None:
             info = r.info('server')
-            assert info['process_id'] == p.pid
-            r.call('SHUTDOWN', 'NOSAVE')
-        except EOFError:
-            pass
-        p.wait(timeout=30)
-    r.close()
+            assert info['process_id'] == p.pid, 'Redis connection belongs to another process'
+            try:
+                r.call('SHUTDOWN', 'NOSAVE')
+            except EOFError:
+                pass
+            p.wait(timeout=30)
+    except BaseException:
+        error = sys.exc_info()
+    finally:
+        try:
+            # Popen still owns this live child; do not signal a socket-reported PID.
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                finally:
+                    try:
+                        p.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=30)
+        except BaseException:
+            if error is None:
+                error = sys.exc_info()
+        finally:
+            try:
+                r.close()
+            except BaseException:
+                if error is None:
+                    error = sys.exc_info()
+    if error is not None:
+        raise error[1].with_traceback(error[2])
 
 
 def export_parse(log):

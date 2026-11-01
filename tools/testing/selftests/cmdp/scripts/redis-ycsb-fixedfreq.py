@@ -25,7 +25,10 @@ import traceback
 
 P = pathlib.Path
 STUDY = P('/home/yans3/cmdp-v2/redis-ycsb-study')
-ROOT = STUDY / 'fixedfreq-v1'
+LEGACY_ROOT = STUDY / 'fixedfreq-v1'
+ROOT = LEGACY_ROOT
+FREQUENCY_ROOT = None
+ELIGIBILITY_REQUIRED = False
 REPO = P('/home/yans3/cmdp-v2/linux-fused-scanner')
 SCRIPTS = REPO / 'tools/testing/selftests/cmdp/scripts'
 HELPER = STUDY / 'tools/redis-ycsb-study.py'
@@ -41,6 +44,107 @@ CONFIG = {'version': 1, 'workloads': ['A', 'B', 'C'],
           'frequency_interval_ms': 11000, 'export_timeout_seconds': 1800,
           'kernel': '7.2.6-cmdp-cpu-production', 'leave_frequency_locked': True,
           'frequency_contract': 'locked-clock', 'nominal_base_khz': 2100000}
+
+
+def frequency_root():
+    return FREQUENCY_ROOT or ROOT
+
+
+def runtime_options():
+    if not ELIGIBILITY_REQUIRED:
+        return []
+    return ['--output-root', str(ROOT), '--frequency-profile-root', str(frequency_root()),
+            '--target-qps', str(CONFIG['target_qps'])]
+
+
+def bootstrap_tools():
+    """Freeze new userspace helpers; never mutate historical helper/binaries."""
+    global HELPER_SHA
+    assert ROOT != LEGACY_ROOT and ROOT != frequency_root()
+    assert os.geteuid() == 0
+    sources = [(SCRIPTS / 'redis-ycsb-study.py', HELPER),
+               (SCRIPTS.parent / 'cmdp_exec', ROOT / 'bin/cmdp_exec')]
+    sources += [(frequency_root() / 'bin' / n, ROOT / 'bin' / n)
+                for n in ('cmdp_monitor', 'frequency_collect')]
+    for src, dst in sources:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            assert sha(src) == sha(dst), 'Frozen tool differs: ' + str(dst)
+        else:
+            shutil.copy2(str(src), str(dst))
+    HELPER_SHA = sha(HELPER)
+
+
+def eligibility_gate(directory, process, validation):
+    """Inventory one complete cohort and independently validate the restored RSS."""
+    directory = P(directory)
+    spec = importlib.util.spec_from_file_location('eligibility', str(SCRIPTS / 'redis-ycsb-eligibility.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    identity = process_identity(process.pid)
+    before = idle_cmdp()
+    started = clock()
+    status = P('/proc/%d/status' % process.pid).read_text()
+    smaps = P('/proc/%d/smaps' % process.pid).read_text()
+    (directory / 'redis-status-eligibility.txt').write_text(status)
+    (directory / 'redis-smaps-eligibility.txt').write_text(smaps)
+    # Precheck policy before issuing any kernel inventory.
+    if not re.search(r'^THP_enabled:\s+0$', status, re.M):
+        report = module.validate_eligibility(status, smaps, '', validation['info']['used_memory'],
+                    page_size=os.sysconf('SC_PAGE_SIZE'), expected_pid=process.pid,
+                    controller_exit_code=None)
+        report.update(redis=identity, started=started, completed=clock(), cmdp_before=before,
+                      cmdp_after=read_stats())
+        report['passed'] = False
+        report['reasons'].append('Redis must inherit complete THP disable; inventory not started')
+        save(directory / 'eligibility.json', report)
+        raise RuntimeError('Redis must inherit complete THP disable')
+    argv = [str(ROOT / 'bin/cmdp_monitor'), '--pid', str(process.pid),
+            '--inventory', '--sweeps', '1', '--scanner-cpu', '0']
+    save(directory / 'inventory-command.json', {'argv': argv, 'redis': identity, 'started': started})
+    controller = None
+    timed_out = False
+    with open(str(directory / 'inventory.jsonl'), 'w') as out, open(str(directory / 'inventory.err'), 'w') as err:
+        controller = subprocess.Popen(argv, stdout=out, stderr=err, start_new_session=True)
+        try:
+            controller.wait(timeout=120)
+        except BaseException:
+            timed_out = True
+            if controller.poll() is None:
+                controller.terminate()
+                controller.wait(timeout=180)
+            raise
+        finally:
+            out.flush()
+            err.flush()
+            report = module.validate_eligibility(status, smaps,
+                    (directory / 'inventory.jsonl').read_text(), validation['info']['used_memory'],
+                    page_size=os.sysconf('SC_PAGE_SIZE'), expected_pid=process.pid,
+                    controller_exit_code=controller.returncode)
+            report.update(redis=identity, started=started, completed=clock(), timed_out=timed_out,
+                          cmdp_before=before, cmdp_after=read_stats())
+            if timed_out:
+                report['passed'] = False
+                report['reasons'].append('inventory exceeded deadline or was interrupted')
+            if (directory / 'inventory.err').read_text().strip():
+                report['passed'] = False
+                report['reasons'].append('inventory stderr is nonempty')
+            try:
+                same_process = process.poll() is None and process_identity(process.pid) == identity
+            except (FileNotFoundError, ProcessLookupError):
+                same_process = False
+            if not same_process:
+                report['passed'] = False
+                report['reasons'].append('Redis identity changed during inventory')
+            for k in ('entries', 'managed', 'isolated', 'waiters'):
+                if report['cmdp_after'][k] != 0:
+                    report['passed'] = False
+                    report['reasons'].append('residual global CMDP ownership: ' + k)
+            save(directory / 'eligibility.json', report)
+    assert report['passed'], report['reasons']
+    B.affinity(process.pid, [1])
+    emit('eligibility_passed', run=directory.name, report=report)
+    return report
 
 
 def now():
@@ -96,7 +200,7 @@ def idle_cmdp():
 
 
 def frequency_policy():
-    profile = json.loads((ROOT / 'profile.json').read_text())
+    profile = json.loads((frequency_root() / 'profile.json').read_text())
     assert profile['status'] == 'qualified_locked', 'Frequency qualification is not complete'
     assert profile['boot_id'] == P('/proc/sys/kernel/random/boot_id').read_text().strip()
     passed = profile['attempts'][-1]
@@ -245,7 +349,7 @@ def ycsb_command(directory, workload, count, warm, duration):
     props.update({'measurementtype': 'raw', 'measurement.interval': 'both',
                   'measurement.raw.no_summary': 'true',
                   'measurement.raw.output_file': str(directory / 'latency.raw'),
-                  'target': 70000})
+                  'target': CONFIG['target_qps']})
     for k, v in sorted(props.items()):
         args += ['-p', '%s=%s' % (k, v)]
     return args, props
@@ -340,6 +444,9 @@ def selected_sources():
     paths = [P(__file__).resolve(), HELPER, SCRIPTS / 'analyze-redis-ycsb-raw.py',
              SCRIPTS / 'cpu-frequency.py', SCRIPTS / 'report-redis-ycsb-fixedfreq.py',
              ROOT / 'bin/cmdp_monitor', ROOT / 'bin/frequency_collect']
+    if ELIGIBILITY_REQUIRED:
+        paths += [ROOT / 'bin/cmdp_exec', SCRIPTS / 'redis-ycsb-eligibility.py',
+                  SCRIPTS / 'redis-ycsb-verify.py']
     return {str(p): sha(p) for p in paths}
 
 
@@ -356,7 +463,7 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
     assert os.geteuid() == 0, 'Root supervision required'
     directory = P(directory)
     assert not directory.exists(), 'Preserve prior attempts; use a fresh run directory'
-    if directory.parent == ROOT / 'campaign-v1':
+    if ELIGIBILITY_REQUIRED or directory.parent == ROOT / 'campaign-v1':
         expected = json.loads((ROOT / 'source-manifest.json').read_text())['hashes']
         assert selected_sources() == expected, 'Frozen campaign sources changed'
     B.mkdir(directory)
@@ -369,9 +476,9 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
     policies = B.policies()
     original_thermal = thermal_counts()
     manifest = json.loads((STUDY / 'artifacts/golden/manifest.json').read_text())
-    save(directory / 'frequency-profile.json', json.loads((ROOT / 'profile.json').read_text()))
+    save(directory / 'frequency-profile.json', json.loads((frequency_root() / 'profile.json').read_text()))
     save(directory / 'run.json', {'at': now(), 'workload': workload, 'mode': mode,
-         'warmup_seconds': warm, 'measure_seconds': duration, 'target_qps': 70000,
+         'warmup_seconds': warm, 'measure_seconds': duration, 'target_qps': CONFIG['target_qps'],
          'workers': 8, 'selected_khz': khz, 'telemetry': telemetry,
          'frequency_contract': CONFIG['frequency_contract'],
          'nominal_base_khz': CONFIG['nominal_base_khz'], 'frequency_reference': reference,
@@ -384,7 +491,8 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
     identities = {'controls': {}}
     emit('restore_start', run=str(directory), workload=workload, mode=mode)
     try:
-        p, r, restore_s = B.start_redis(directory, STUDY / 'artifacts/golden')
+        p, r, restore_s = B.start_redis(directory, STUDY / 'artifacts/golden',
+                    exec_prefix=[ROOT / 'bin/cmdp_exec', '--'])
         identities['redis'] = process_identity(p.pid)
         save(directory / 'processes.json', identities)
         validation = B.validate_db(r, manifest['recordcount'], manifest['samples'])
@@ -393,6 +501,8 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
               'rdb_sha256': manifest['rdb_sha256'], 'redis': process_identity(p.pid)})
         for name in ('numa_maps', 'smaps_rollup'):
             (directory / ('redis-' + name + '-before.txt')).write_text(P('/proc/%d/%s' % (p.pid, name)).read_text())
+        gate = eligibility_gate(directory, p, validation)
+        before = idle_cmdp()  # Exclude the identical, read-only inventory from OFF accounting.
         if mode != 'off':
             argv = [ROOT / 'bin/cmdp_monitor', '--pid', p.pid, '--scanner-cpu', 0,
                     '--period-ms', 10000, '--quiet-ms', 10000,
@@ -519,9 +629,11 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
             (directory / ('redis-' + name + '-after.txt')).write_text(P('/proc/%d/%s' % (p.pid, name)).read_text())
         B.stop_redis(p, r)
         r = None
+        save(directory / 'cleanup.json', {'at': now(), 'passed': True,
+             'cmdp': idle_cmdp(), 'redis_exited': p.poll() is not None})
         window = [x for x in observations if timeline['start_ms'] * 1000000 <= x['clock']['realtime_ns'] < timeline['end_ms'] * 1000000]
         summary = {'at': now(), 'status': 'captured_pending_raw_analysis', 'workload': workload,
-                   'mode': mode, 'workers': 8, 'target_qps': 70000, 'selected_khz': khz,
+                   'mode': mode, 'workers': 8, 'target_qps': CONFIG['target_qps'], 'selected_khz': khz,
                    'timeline': timeline, 'restore_seconds': restore_s, 'counters': counters,
                    'redis_rss_peak': max(x['redis']['rss_bytes'] for x in window),
                    'client_rss_peak': max(x['client']['rss_bytes'] for x in window),
@@ -529,7 +641,8 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
                    'cmdp_before': before, 'cmdp_after': after, 'frequency_telemetry': telemetry,
                    'frequency_policy_verified_start': True, 'frequency_policy_verified_end': True,
                    'clock_offset_max_change_ns': clock_offset_max_change_ns,
-                   'query_and_export_seconds': time.monotonic() - launched}
+                   'query_and_export_seconds': time.monotonic() - launched,
+                   'eligibility': gate}
         save(directory / 'capture-summary.json', summary)
         hashes = {str(x.relative_to(directory)): sha(x) for x in directory.rglob('*') if x.is_file()}
         save(directory / 'capture-receipt.json', {'at': now(), 'passed': True, 'files_sha256': hashes})
@@ -553,7 +666,14 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
                 client.kill()
                 client.wait()
         if p is not None and r is not None:
-            B.stop_redis(p, r)
+            try:
+                B.stop_redis(p, r)
+            finally:
+                stats = read_stats()
+                save(directory / 'cleanup.json', {'at': now(),
+                     'passed': p.poll() is not None and all(stats[k] == 0 for k in
+                         ('entries', 'managed', 'isolated', 'waiters')),
+                     'cmdp': stats, 'redis_exited': p.poll() is not None})
 
 
 def analyze_run(directory):
@@ -583,6 +703,7 @@ def suite():
     assert os.geteuid() == 0
     assert json.loads((ROOT / 'config.json').read_text()) == CONFIG
     runner = str(P(__file__).resolve())
+    options = runtime_options()
     stages = [('B-' + mode + '-smoke-v1', 'B', mode, 40, True)
               for mode in CONFIG['modes']]
     stages += [('A-off-smoke-v1', 'A', 'off', 40, True)]
@@ -603,11 +724,11 @@ def suite():
                 '--mode', mode, '--seconds', str(seconds)]
         if not telemetry:
             argv.append('--no-frequency-telemetry')
-        subprocess.check_call(argv)
+        subprocess.check_call(argv + options)
     save(ROOT / 'suite-state.json', {'at': now(), 'status': 'campaign'})
-    subprocess.check_call([sys.executable, runner, 'resume'])
+    subprocess.check_call([sys.executable, runner, 'resume'] + options)
     save(ROOT / 'suite-state.json', {'at': now(), 'status': 'analysis'})
-    subprocess.check_call([sys.executable, runner, 'analyze', '--jobs', '8'])
+    subprocess.check_call([sys.executable, runner, 'analyze', '--jobs', '8'] + options)
     subprocess.check_call([sys.executable, str(SCRIPTS / 'report-redis-ycsb-fixedfreq.py'),
                            'campaign', '--directory', str(ROOT / 'campaign-v1'),
                            '--output-dir', str(ROOT / 'analysis')])
@@ -623,6 +744,10 @@ def matrix():
 
 
 def prepare():
+    if ELIGIBILITY_REQUIRED and (ROOT / 'source-manifest.json').exists():
+        assert json.loads((ROOT / 'config.json').read_text()) == CONFIG, 'Frozen configuration changed'
+        assert json.loads((ROOT / 'source-manifest.json').read_text())['hashes'] == selected_sources(), 'Frozen sources changed; preserve this root and use a new one'
+        return
     B.mkdir(ROOT / 'campaign-v1')
     B.mkdir(ROOT / 'pilots')
     golden = STUDY / 'artifacts/golden'
@@ -655,14 +780,23 @@ def prepare():
         save(manifest_path, {'at': now(), 'hashes': hashes,
              'commit': B.command(['git', '-C', REPO, 'rev-parse', 'HEAD'])})
     wrapper = ROOT / 'bin/redis-ycsb-campaign'
-    wrapper.write_text('#!/bin/sh\nexec python3 ' + str(P(__file__).resolve()) + ' "$@"\n')
+    import shlex
+    argv = ['python3', str(P(__file__).resolve())]
+    if ELIGIBILITY_REQUIRED:
+        argv += ['--output-root', str(ROOT), '--frequency-profile-root', str(frequency_root()),
+                 '--target-qps', str(CONFIG['target_qps'])]
+    wrapper.write_text('#!/bin/sh\nexec ' + ' '.join(shlex.quote(x) for x in argv) + ' "$@"\n')
     wrapper.chmod(0o755)
     emit('prepared', root=str(ROOT))
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=['prepare', 'pilot', 'run', 'resume', 'suite', 'status', 'analyze'])
+    global ROOT, FREQUENCY_ROOT, HELPER, HELPER_SHA, ELIGIBILITY_REQUIRED
+    p.add_argument('action', choices=['prepare', 'pilot', 'run', 'resume', 'suite', 'status', 'analyze', 'verify-eligibility'])
+    p.add_argument('--output-root', type=P)
+    p.add_argument('--frequency-profile-root', type=P)
+    p.add_argument('--target-qps', type=int)
     p.add_argument('--workload', choices=['A', 'B', 'C'], default='B')
     p.add_argument('--mode', choices=['off', 'sampling', 'arm'], default='off')
     p.add_argument('--seconds', type=int, default=40)
@@ -674,14 +808,46 @@ def main():
     p.add_argument('--frequency-contract', choices=['locked-clock', 'fixed-policy'],
                    help='prepare only: explicitly freeze strict effective clock or fixed requested policy')
     args = p.parse_args()
-    load_helper()
+    if args.output_root:
+        ROOT = args.output_root.resolve()
+    if args.frequency_profile_root:
+        FREQUENCY_ROOT = args.frequency_profile_root.resolve()
+    if ROOT != LEGACY_ROOT and args.output_root:
+        FREQUENCY_ROOT = FREQUENCY_ROOT or LEGACY_ROOT
+        ELIGIBILITY_REQUIRED = True
+        HELPER = ROOT / 'tools/redis-ycsb-study.py'
+    if args.target_qps is not None:
+        assert args.target_qps > 0
+        CONFIG['target_qps'] = args.target_qps
+    elif args.action == 'verify-eligibility':
+        CONFIG['target_qps'] = 50000
+    if args.action == 'verify-eligibility':
+        assert ELIGIBILITY_REQUIRED, '--output-root must name a new evidence root'
+        CONFIG.update(version=2, eligibility_required=True, verification_only=True,
+                      measure_seconds=120, repetitions=1, workloads=['B'])
     if (ROOT / 'config.json').exists():
         stored = json.loads((ROOT / 'config.json').read_text())
         CONFIG['frequency_contract'] = stored.get('frequency_contract', 'locked-clock')
+        if ELIGIBILITY_REQUIRED:
+            if args.target_qps is not None:
+                assert args.target_qps == stored['target_qps'], 'Cannot change frozen target'
+            CONFIG.update(stored)
     if args.frequency_contract:
-        if args.action != 'prepare':
-            p.error('--frequency-contract is only accepted by prepare')
+        if args.action not in ('prepare', 'verify-eligibility'):
+            p.error('--frequency-contract is only accepted by prepare or verify-eligibility')
         CONFIG['frequency_contract'] = args.frequency_contract
+    if ROOT == LEGACY_ROOT and args.action not in ('status', 'analyze'):
+        raise RuntimeError('Historical coverage-invalid root is read-only; select a new --output-root')
+    if CONFIG.get('verification_only') and args.action in ('run', 'resume', 'suite', 'pilot'):
+        raise RuntimeError('Verification-only root cannot run a generic campaign; use a new root')
+    if ELIGIBILITY_REQUIRED and args.action in ('prepare', 'verify-eligibility'):
+        # Bootstrap is serialized below, alongside frequency-policy controllers.
+        pass
+    elif ELIGIBILITY_REQUIRED:
+        HELPER_SHA = json.loads((ROOT / 'source-manifest.json').read_text())['hashes'][str(HELPER)]
+        load_helper()
+    else:
+        load_helper()
     if args.action == 'suite':
         ROOT.mkdir(parents=True, exist_ok=True)
         with open(str(ROOT / 'suite.lock'), 'a') as lock:
@@ -696,10 +862,19 @@ def main():
                 raise
         return
     if args.action == 'status':
+        if CONFIG.get('verification_only'):
+            path = ROOT / 'verify-state.json'
+            summary = ROOT / 'verify-summary.json'
+            value = json.loads(summary.read_text()) if summary.exists() else {}
+            emit('verification_status', root=str(ROOT),
+                 state=json.loads(path.read_text()) if path.exists() else None,
+                 passed=value.get('passed'), completed_checks=len(value.get('smoke_checks', [])),
+                 expected_checks=3)
+            return
         captured = sorted((ROOT / 'campaign-v1').glob('*/capture-receipt.json'))
         analyzed = sorted((ROOT / 'campaign-v1').glob('*/receipt.json'))
         failures = sorted((ROOT / 'campaign-v1').glob('*/failure.json'))
-        profile = json.loads((ROOT / 'profile.json').read_text()) if (ROOT / 'profile.json').exists() else {}
+        profile = json.loads((frequency_root() / 'profile.json').read_text()) if (frequency_root() / 'profile.json').exists() else {}
         suite_state = json.loads((ROOT / 'suite-state.json').read_text()) if (ROOT / 'suite-state.json').exists() else None
         emit('status', captured=len(captured), analyzed=len(analyzed), expected=27,
              pilots_analyzed=len(list((ROOT / 'pilots').glob('*/receipt.json'))),
@@ -711,9 +886,19 @@ def main():
              if (ROOT / 'campaign-state.json').exists() else None)
         return
     ROOT.mkdir(parents=True, exist_ok=True)
-    with open(str(ROOT / 'experiment.lock'), 'a') as lock:
+    with open(str(frequency_root() / 'experiment.lock'), 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if args.action == 'prepare':
+        if ELIGIBILITY_REQUIRED and args.action in ('prepare', 'verify-eligibility'):
+            bootstrap_tools()
+            load_helper()
+        if args.action == 'verify-eligibility':
+            assert CONFIG['target_qps'] == 50000 and CONFIG['measure_seconds'] == 120
+            prepare()
+            spec = importlib.util.spec_from_file_location('eligibility_workflow', str(SCRIPTS / 'redis-ycsb-verify.py'))
+            workflow = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(workflow)
+            workflow.run(sys.modules[__name__])
+        elif args.action == 'prepare':
             prepare()
         elif args.action == 'pilot':
             assert args.name, '--name is required to preserve pilot attempts'
