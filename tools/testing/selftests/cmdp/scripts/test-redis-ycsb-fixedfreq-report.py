@@ -262,6 +262,79 @@ class FixedFrequencyReportTest(unittest.TestCase):
         self.assertEqual(result["metrics"]["client_cpu_percent_of_eight_cores"], 25)
         self.assertEqual(result["metrics"]["cmdp_write_hook_mean_us"], 3)
         self.assertAlmostEqual(result["metrics"]["target_shortfall_pct"], 100 / 14)
+        self.assertTrue(result["throughput_diagnostic"]["below_99_percent_target"])
+        self.assertTrue(any("below 99%" in warning for warning in result["validation"]["warnings"]))
+
+    def test_attainment_is_diagnostic_not_a_saturation_test(self):
+        path = self.make_run(self.directory / "B-arm-r1")
+        manifest = REPORT.read_json(path / "run.json")
+        manifest.update(target_qps=65000, warmup_seconds=60, measure_seconds=20)
+        REPORT.save(path / "run.json", manifest)
+        result = REPORT.report_run(path)
+        self.assertTrue(result["validation"]["passed"])
+        self.assertFalse(result["throughput_diagnostic"]["below_99_percent_target"])
+        self.assertIn("does not prove", result["throughput_diagnostic"]["interpretation"])
+        self.assertEqual(result["warmup_seconds"], 60)
+        self.assertEqual(result["measure_seconds"], 20)
+        manifest["measure_seconds"] = 600
+        REPORT.save(path / "run.json", manifest)
+        self.assertFalse(REPORT.report_run(path)["validation"]["passed"])
+
+    def make_campaign(self, targets=None):
+        targets = targets or {workload: 70000 for workload in REPORT.WORKLOADS}
+        source = self.make_run(self.directory / "source-fixture")
+        template = REPORT.report_run(source)
+        for workload in REPORT.WORKLOADS:
+            for mode in REPORT.MODES:
+                for rep in range(1, 4):
+                    result = copy.deepcopy(template)
+                    result.update(workload=workload, mode=mode, run_name="%s-%s-r%d" % (workload, mode, rep),
+                                  target_qps=targets[workload], warmup_seconds=60, measure_seconds=20)
+                    result["metrics"]["achieved_qps"] = targets[workload]
+                    REPORT.save(self.directory / result["run_name"] / "report.json", result)
+        return REPORT.aggregate_campaign(self.directory)
+
+    def test_campaign_accepts_workload_targets_and_dynamic_description(self):
+        campaign = self.make_campaign({"A": 66000, "B": 59000, "C": 58000})
+        self.assertTrue(campaign["validation"]["passed"], campaign["validation"])
+        self.assertEqual(campaign["targets_qps"], {"A": 66000, "B": 59000, "C": 58000})
+        markdown = REPORT.markdown_report(campaign)
+        for text in ("A: 66000 QPS", "B: 59000 QPS", "C: 58000 QPS", "Excluded warmup seconds: 60"):
+            self.assertIn(text, markdown)
+        self.assertNotIn("70k", markdown)
+        self.assertNotIn("20 seconds excluded", markdown)
+        group = next(group for group in campaign["groups"] if group["workload"] == "B" and group["mode"] == "off")
+        self.assertEqual(group["throughput_diagnostic"]["below_99_percent_target_runs"], [])
+
+    def test_campaign_preserves_same_target_and_rejects_inconsistent_target(self):
+        self.assertTrue(self.make_campaign()["validation"]["passed"])
+        path = self.directory / "B-arm-r2" / "report.json"
+        result = REPORT.read_json(path)
+        result["target_qps"] = 59000
+        REPORT.save(path, result)
+        campaign = REPORT.aggregate_campaign(self.directory)
+        self.assertFalse(campaign["validation"]["passed"])
+        self.assertTrue(any("target QPS" in error for error in campaign["validation"]["errors"]))
+
+    def test_campaign_warmup_is_matched_within_each_repetition(self):
+        self.make_campaign()
+        for mode in REPORT.MODES:
+            path = self.directory / ("B-%s-r2" % mode) / "report.json"
+            result = REPORT.read_json(path)
+            result["warmup_seconds"] = 120
+            REPORT.save(path, result)
+        campaign = REPORT.aggregate_campaign(self.directory)
+        self.assertTrue(campaign["validation"]["passed"], campaign["validation"])
+        path = self.directory / "B-arm-r2" / "report.json"
+        result = REPORT.read_json(path)
+        result["warmup_seconds"] = 240
+        result["metrics"]["achieved_qps"] = 60000
+        REPORT.save(path, result)
+        campaign = REPORT.aggregate_campaign(self.directory)
+        self.assertFalse(campaign["validation"]["passed"])
+        self.assertTrue(any("inconsistent warmup" in error for error in campaign["validation"]["errors"]))
+        group = next(group for group in campaign["groups"] if group["workload"] == "B" and group["mode"] == "arm")
+        self.assertEqual(group["throughput_diagnostic"]["below_99_percent_target_runs"], ["B-arm-r2"])
 
     def test_run_bad_flush_accounting_and_raw_validation_remain_invalid(self):
         path = self.make_run(self.directory / "B-arm-r1")

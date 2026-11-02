@@ -340,7 +340,164 @@ def export_report(path):
     return report
 
 
-def ycsb_command(directory, workload, count, warm, duration):
+def effective_target(target_qps):
+    target = CONFIG['target_qps'] if target_qps is None else target_qps
+    if isinstance(target, bool) or not isinstance(target, int) or target <= 0:
+        raise ValueError('target_qps must be a positive integer')
+    return target
+
+
+class WarmupNotReady(RuntimeError):
+    """Healthy monitoring needs a longer *common matched-block* warmup."""
+    def __init__(self, report):
+        self.report = report
+        RuntimeError.__init__(self, 'Initial ARM-bearing sweep not complete before measurement')
+
+
+def arm_readiness(rows, start_boundary, used_memory, expected_pid, page_size=4096):
+    """Audit evidence available at the start boundary; never infer ARM from counters.
+
+    A completed priming scan plus partial ARM progress is deliberately insufficient.
+    A successful ARM-bearing full-dataset scan must end before the fixed scheduled
+    measurement start. Later observations cannot retroactively qualify a run.
+    """
+    scheduled = start_boundary['scheduled_monotonic_ns']
+    requested = start_boundary['requested']['monotonic_ns']
+    checked = start_boundary['completed']['monotonic_ns']
+    report = {'required': True, 'passed': False, 'retryable': False,
+              'scheduled_measurement_start_ns': scheduled,
+              'boundary_requested_ns': requested, 'boundary_completed_ns': checked,
+              'expected_pid': expected_pid, 'page_size': page_size,
+              'used_memory_bytes': used_memory, 'minimum_eligible_fraction': .9,
+              'arm_coverage_requirement': 'reported; no minimum live ARM fraction',
+              'condition': 'successful complete ARM-bearing full-dataset sweep ended before scheduled start',
+              'reasons': [], 'initial_arm_sweep': None}
+    reasons = report['reasons']
+    if not 0 < scheduled <= requested <= checked:
+        reasons.append('Invalid measurement boundary monotonic ordering')
+    if used_memory <= 0 or page_size <= 0:
+        reasons.append('Invalid dataset size or page size')
+    # A live writer can append while we read. Only evaluate the prefix known at
+    # the completed boundary, including its explicit status snapshot.
+    def timestamp(row):
+        return row.get('observed_ns', row.get('now_ns', row.get('monotonic_ns', 0)))
+    prefix = [row for row in rows if timestamp(row) <= checked]
+    snapshot = start_boundary.get('controllers', {}).get('cmdp', [])
+    current = [row for row in snapshot if 'terminals' in row]
+    if len(current) != 1:
+        reasons.append('Missing or ambiguous start-boundary CMD-P status')
+    else:
+        current = current[0]
+        report['boundary_status'] = current
+        if not requested <= current.get('now_ns', 0) <= checked:
+            reasons.append('Start-boundary status timestamp is outside its boundary')
+        if current.get('state') != 2 or current.get('stop_reason') != 'none':
+            reasons.append('CMD-P is not running at measurement start')
+        if current.get('target_pid') != expected_pid:
+            reasons.append('Start-boundary target PID differs from restored Redis')
+    statuses = [row for row in prefix if 'terminals' in row]
+    statuses += [row for row in snapshot if 'terminals' in row]
+    if not statuses:
+        reasons.append('Missing CMD-P status evidence')
+    session_ids = set(row.get('session_id') for row in statuses)
+    if len(session_ids) != 1 or None in session_ids:
+        reasons.append('Missing or inconsistent monitor session identity')
+    for row in statuses:
+        if row.get('target_pid') != expected_pid:
+            reasons.append('Monitor target identity changed')
+        if row.get('resource_failures') != 0 or row.get('reports_dropped') != 0:
+            reasons.append('Monitor resource failure or dropped report')
+        if row.get('terminals', {}).get('error') != 0:
+            reasons.append('Monitor error terminal before measurement')
+    cpus = [row for row in snapshot if row.get('event') == 'cpu_status']
+    if len(cpus) != 1:
+        reasons.append('Missing scanner CPU status at measurement start')
+    for row in [row for row in prefix if row.get('event') == 'cpu_status'] + cpus:
+        if row.get('cpu') != 0 or any(row.get(k) != 0 for k in
+                ('error', 'wrong_cpu_work_items', 'offline_events')):
+            reasons.append('Scanner CPU assignment or execution failed')
+        if row.get('work_items', 0) and row.get('last_cpu') != 0:
+            reasons.append('Scanner ran away from CPU0')
+    dirty = [row for row in prefix + snapshot if row.get('event') == 'dirty_status']
+    if not dirty:
+        reasons.append('Missing dirty-sampling evidence')
+    if any(row.get('resource_skips') != 0 for row in dirty):
+        reasons.append('Dirty sampling encountered resource skips')
+    if any(row.get('mode') != 2 for row in dirty):
+        reasons.append('Monitor is not in dirty-qualify mode')
+    if any(row.get('event') in ('cohort_missing', 'controller_exit', 'stop_request') for row in prefix):
+        reasons.append('Missing cohort or unexpected controller stop before measurement')
+    cohorts = [row for row in prefix if row.get('event') in
+               ('sweep', 'cohort_snapshot', 'cohort_observation_end', 'cohort_final')]
+    candidates = []
+    for row in cohorts:
+        if row.get('error') != 0:
+            reasons.append('Monitor scan error before measurement')
+        skips = row.get('skips', {})
+        if skips.get('thp_policy') != 0 or skips.get('resource') != 0:
+            reasons.append('Monitor THP-policy or resource exclusions')
+        if row.get('complete') != 1 or row.get('error') != 0:
+            continue
+        if not 0 < row.get('start_ns', 0) <= row.get('end_ns', 0) <= row.get('observed_ns', 0):
+            reasons.append('Invalid completed-sweep monotonic ordering')
+            continue
+        if row['end_ns'] > scheduled:
+            continue
+        if row.get('eligible_pages', 0) * page_size < .9 * used_memory:
+            reasons.append('Completed workload scan excludes substantial dataset memory')
+        if row.get('first_arms', 0) + row.get('rearms', 0) > 0:
+            candidates.append(row)
+    if candidates:
+        initial = min(candidates, key=lambda row: (row['pass_id'], row['observed_ns']))
+        report['initial_arm_sweep'] = initial
+        report['completion_margin_ns'] = scheduled - initial['end_ns']
+        report['evidence_observed_ns'] = initial['observed_ns']
+        if isinstance(current, dict) and current.get('passes_completed', 0) < initial['pass_id']:
+            reasons.append('Boundary completed-pass count disagrees with ARM sweep')
+    report['reasons'] = sorted(set(reasons))
+    if report['reasons']:
+        return report
+    if not candidates:
+        report['retryable'] = True
+        report['reasons'] = ['No successful complete ARM-bearing sweep ended before scheduled measurement start']
+        return report
+    report['passed'] = True
+    return report
+
+
+def check_capture_readiness(directory, mode, start_boundary, used_memory, identity, required=False):
+    """Persist the gate proof before proceeding; failure leaves no capture receipt."""
+    directory = P(directory)
+    if required:
+        raw = (directory / 'cmdp.jsonl').read_bytes()
+        complete = raw[:raw.rfind(b'\n') + 1]
+        rows = [json.loads(line.decode('utf-8')) for line in complete.splitlines() if line]
+        report = arm_readiness(rows, start_boundary, used_memory, identity['pid'],
+                               page_size=os.sysconf('SC_PAGE_SIZE'))
+        report['trace_prefix'] = {'path': 'cmdp.jsonl', 'bytes': len(complete),
+                                 'sha256': hashlib.sha256(complete).hexdigest(),
+                                 'ignored_partial_line_bytes': len(raw) - len(complete)}
+        stderr = directory / 'cmdp.err'
+        if stderr.exists() and stderr.read_text().strip():
+            report['passed'] = report['retryable'] = False
+            report['reasons'].append('CMD-P controller stderr is nonempty')
+    else:
+        report = {'required': False, 'passed': True, 'retryable': False,
+                  'condition': 'ARM completion gate not requested for this mode',
+                  'scheduled_measurement_start_ns': start_boundary['scheduled_monotonic_ns'],
+                  'boundary_completed_ns': start_boundary['completed']['monotonic_ns'],
+                  'reasons': []}
+    report.update(at=now(), mode=mode, redis=identity, checked=clock())
+    save(directory / 'readiness.json', report)
+    if not report['passed']:
+        if report['retryable']:
+            raise WarmupNotReady(report)
+        raise RuntimeError('ARM warmup validation failed: ' + '; '.join(report['reasons']))
+    return report
+
+
+def ycsb_command(directory, workload, count, warm, duration, target_qps=None):
+    target_qps = effective_target(target_qps)
     args, props = B.ycsb_argv(directory, workload, count, 8, 8,
                               seconds=warm + duration + 5)
     args = args[:args.index('-p')]
@@ -349,7 +506,7 @@ def ycsb_command(directory, workload, count, warm, duration):
     props.update({'measurementtype': 'raw', 'measurement.interval': 'both',
                   'measurement.raw.no_summary': 'true',
                   'measurement.raw.output_file': str(directory / 'latency.raw'),
-                  'target': CONFIG['target_qps']})
+                  'target': target_qps})
     for k, v in sorted(props.items()):
         args += ['-p', '%s=%s' % (k, v)]
     return args, props
@@ -459,7 +616,10 @@ def verify_capture_receipt(directory):
     return receipt
 
 
-def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
+def capture(directory, workload, mode, warm=20, duration=600, telemetry=True,
+            target_qps=None, require_arm_ready=False):
+    target_qps = effective_target(target_qps)
+    assert not require_arm_ready or mode == 'arm', 'ARM readiness is only applicable to ARM mode'
     assert os.geteuid() == 0, 'Root supervision required'
     directory = P(directory)
     assert not directory.exists(), 'Preserve prior attempts; use a fresh run directory'
@@ -478,12 +638,14 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
     manifest = json.loads((STUDY / 'artifacts/golden/manifest.json').read_text())
     save(directory / 'frequency-profile.json', json.loads((frequency_root() / 'profile.json').read_text()))
     save(directory / 'run.json', {'at': now(), 'workload': workload, 'mode': mode,
-         'warmup_seconds': warm, 'measure_seconds': duration, 'target_qps': CONFIG['target_qps'],
+         'warmup_seconds': warm, 'measure_seconds': duration, 'target_qps': target_qps,
+         'require_arm_ready': require_arm_ready,
          'workers': 8, 'selected_khz': khz, 'telemetry': telemetry,
          'frequency_contract': CONFIG['frequency_contract'],
          'nominal_base_khz': CONFIG['nominal_base_khz'], 'frequency_reference': reference,
          'policy': policies, 'source_hashes': selected_sources()})
     p = r = client = None
+    log_reader = None
     controls = []
     stopped = False
     observations = []
@@ -520,7 +682,8 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
             c.request('ready')
         for c in controls:
             c.wait_snapshot('ready')
-        args, props = ycsb_command(directory, workload, manifest['recordcount'], warm, duration)
+        args, props = ycsb_command(directory, workload, manifest['recordcount'], warm, duration,
+                                   target_qps=target_qps)
         save(directory / 'command.json', {'argv': args, 'properties': props})
         client = B.spawn(args, directory, directory / 'ycsb.log', '26-33', 1)
         identities['ycsb'] = process_identity(client.pid)
@@ -570,6 +733,10 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
                             boundaries[name]['scheduled_monotonic_ns'] = int(deadline * 1e9)
                             boundaries[name]['request_lateness_ns'] = boundaries[name]['requested']['monotonic_ns'] - int(deadline * 1e9)
                             save(directory / 'boundaries.json', boundaries)
+                            if name == 'measurement_start':
+                                check_capture_readiness(directory, mode, boundaries[name],
+                                        validation['info']['used_memory'], identities['redis'],
+                                        required=require_arm_ready)
                             emit(name, run=directory.name)
                     if 'measurement_end' in boundaries and not stopped:
                         for c in controls:
@@ -621,6 +788,16 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
         if mode == 'off':
             assert after == before
         validate_control(directory)
+        monitoring = None
+        if mode != 'off' and CONFIG.get('tail_latency_campaign'):
+            spec = importlib.util.spec_from_file_location('monitoring_validation',
+                    str(SCRIPTS / 'redis-ycsb-verify.py'))
+            verifier = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(verifier)
+            monitoring = verifier.monitoring_summary(
+                    [json.loads(line) for line in (directory / 'cmdp.jsonl').read_text().splitlines()],
+                    mode, validation['info']['used_memory'])
+            save(directory / 'monitoring-validation.json', monitoring)
         if telemetry:
             analyze_frequency(directory, timeline, khz)
         assert r.call('DBSIZE') == manifest['recordcount'] + 1
@@ -633,7 +810,7 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
              'cmdp': idle_cmdp(), 'redis_exited': p.poll() is not None})
         window = [x for x in observations if timeline['start_ms'] * 1000000 <= x['clock']['realtime_ns'] < timeline['end_ms'] * 1000000]
         summary = {'at': now(), 'status': 'captured_pending_raw_analysis', 'workload': workload,
-                   'mode': mode, 'workers': 8, 'target_qps': CONFIG['target_qps'], 'selected_khz': khz,
+                   'mode': mode, 'workers': 8, 'target_qps': target_qps, 'selected_khz': khz,
                    'timeline': timeline, 'restore_seconds': restore_s, 'counters': counters,
                    'redis_rss_peak': max(x['redis']['rss_bytes'] for x in window),
                    'client_rss_peak': max(x['client']['rss_bytes'] for x in window),
@@ -642,7 +819,8 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
                    'frequency_policy_verified_start': True, 'frequency_policy_verified_end': True,
                    'clock_offset_max_change_ns': clock_offset_max_change_ns,
                    'query_and_export_seconds': time.monotonic() - launched,
-                   'eligibility': gate}
+                   'eligibility': gate, 'monitoring': monitoring,
+                   'readiness': json.loads((directory / 'readiness.json').read_text())}
         save(directory / 'capture-summary.json', summary)
         hashes = {str(x.relative_to(directory)): sha(x) for x in directory.rglob('*') if x.is_file()}
         save(directory / 'capture-receipt.json', {'at': now(), 'passed': True, 'files_sha256': hashes})
@@ -652,6 +830,8 @@ def capture(directory, workload, mode, warm=20, duration=600, telemetry=True):
         save(directory / 'failure.json', {'at': now(), 'error': str(e), 'traceback': traceback.format_exc()})
         raise
     finally:
+        if log_reader is not None:
+            log_reader.close()
         if not stopped:
             for c in controls:
                 try:
@@ -838,6 +1018,8 @@ def main():
         CONFIG['frequency_contract'] = args.frequency_contract
     if ROOT == LEGACY_ROOT and args.action not in ('status', 'analyze'):
         raise RuntimeError('Historical coverage-invalid root is read-only; select a new --output-root')
+    if CONFIG.get('tail_latency_campaign') and args.action not in ('status', 'analyze'):
+        raise RuntimeError('Tail-latency root requires the dedicated tail campaign driver')
     if CONFIG.get('verification_only') and args.action in ('run', 'resume', 'suite', 'pilot'):
         raise RuntimeError('Verification-only root cannot run a generic campaign; use a new root')
     if ELIGIBILITY_REQUIRED and args.action in ('prepare', 'verify-eligibility'):

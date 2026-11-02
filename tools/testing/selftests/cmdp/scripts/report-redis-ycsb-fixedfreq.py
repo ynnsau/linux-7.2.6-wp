@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import sys
 
@@ -456,6 +457,22 @@ def report_run(directory, expected_cpus=None):
                                    "wp_events_cumulative": row["terminals"]["write"]})
     actual_qps = latency["combined"]["actual"]["qps"]
     target = manifest["target_qps"]
+    if target <= 0:
+        raise ValueError("Nonpositive target QPS")
+    measured_seconds = (end_ns - start_ns) / NSEC
+    warmup_seconds = manifest.get("warmup_seconds")
+    if warmup_seconds is None and "query_epoch_ms" in timeline:
+        warmup_seconds = (timeline["start_ms"] - timeline["query_epoch_ms"]) / 1000
+    if (manifest.get("measure_seconds") is not None and
+            abs(manifest["measure_seconds"] - measured_seconds) > .001):
+        errors.append("Declared measurement duration differs from latency window")
+    throughput = {"target_qps": target, "achieved_qps": actual_qps,
+                  "attainment_fraction": actual_qps / target,
+                  "shortfall_threshold_fraction": .99,
+                  "below_99_percent_target": actual_qps < .99 * target,
+                  "interpretation": "Below 99% of target flags a throughput shortfall; meeting this threshold does not prove absence of saturation or queueing. Inspect intended-start latency and time series."}
+    if throughput["below_99_percent_target"]:
+        warnings.append("Achieved QPS is below 99% of this workload's target; latency may include saturation or insufficient offered load")
     latency_summary = {}
     for name, stream in latency["streams"].items():
         if stream["successful_workload_stream"]:
@@ -493,6 +510,8 @@ def report_run(directory, expected_cpus=None):
     return {"schema_version": 1, "directory": str(directory), "run_name": directory.name,
             "workload": manifest["workload"], "mode": mode, "workers": manifest["workers"],
             "target_qps": target, "selected_khz": manifest["selected_khz"],
+            "warmup_seconds": warmup_seconds, "measure_seconds": measured_seconds,
+            "throughput_diagnostic": throughput,
             "frequency_contract": contract, "nominal_base_khz": nominal_base_khz,
             "frequency_contract_evidence": contract_evidence,
             "timeline": timeline, "metrics": metric, "latency": latency_summary,
@@ -501,6 +520,7 @@ def report_run(directory, expected_cpus=None):
             "latency_time_series": latency["per_second"],
             "measurement_notes": ["Percentiles use every retained raw record, not a sampled latency stream.",
                                   "Intended latency includes delay against YCSB's bounded-worker request schedule.",
+                                  "A 99% aggregate target-attainment flag is diagnostic only; sustained average QPS does not establish absence of queueing or transient saturation.",
                                   "CPU percentages use first/last process observations inside the window, with actual wall time.",
                                   "ARM exposure integrates active pages in the kernel; its exact status-window mean is reported.",
                                   "WP events count write-terminated ARM generations; write-hook time is not complete page-fault time.",
@@ -546,17 +566,53 @@ def aggregate_campaign(directory, expected_repetitions=3):
                            "valid_runs": [report["run_name"] for report in valid],
                            "excluded_invalid_runs": [report["run_name"] for report in selected
                                                      if not report["validation"]["passed"]],
-                           "metrics": metrics, "latency_us": latency})
+                           "metrics": metrics, "latency_us": latency,
+                           "target_qps": sorted(set(report["target_qps"] for report in valid)),
+                           "throughput_diagnostic": {
+                               "threshold_fraction": .99,
+                               "below_99_percent_target_runs": [report["run_name"] for report in valid
+                                   if report["metrics"]["achieved_qps"] < .99 * report["target_qps"]],
+                               "scope": "Per-run shortfall against its workload target; not a test proving absence of saturation"}})
     if len(reports) != len(WORKLOADS) * len(MODES) * expected_repetitions:
         errors.append("Campaign has %d report files, expected %d" %
                       (len(reports), len(WORKLOADS) * len(MODES) * expected_repetitions))
-    configurations = {(report["workers"], report["target_qps"], report["selected_khz"],
+    configurations = {(report["workers"], report["selected_khz"],
                        report.get("frequency_contract", "locked-clock"), report.get("nominal_base_khz"))
                       for report in reports}
     if len(configurations) != 1:
-        errors.append("Campaign reports do not share one worker/target/frequency/contract/reference configuration")
+        errors.append("Campaign reports do not share one worker/frequency/contract/reference configuration")
+    targets = {}
+    for workload in WORKLOADS:
+        values = sorted(set(report["target_qps"] for report in reports if report["workload"] == workload))
+        targets[workload] = values[0] if len(values) == 1 else None
+        if len(values) != 1:
+            errors.append("%s: workload target QPS is missing or inconsistent across modes/repetitions" % workload)
+    # A longer readiness warmup is allowed between matched blocks, but never
+    # between modes within one workload/repetition. Older reports can omit it.
+    matched_blocks = collections.defaultdict(list)
+    for report in reports:
+        match = re.match(r"^([ABC])-(off|sampling|arm)-r([1-9][0-9]*)$", report["run_name"])
+        if match and report["validation"]["passed"]:
+            matched_blocks[(report["workload"], int(match.group(3)))].append(report)
+    block_summaries = []
+    for (workload, repetition), block in sorted(matched_blocks.items()):
+        warmups = {report.get("warmup_seconds") for report in block}
+        modes = [report["mode"] for report in block]
+        if len(warmups) > 1:
+            errors.append("%s/r%d: matched modes have inconsistent warmup durations" % (workload, repetition))
+        if sorted(modes) != sorted(MODES):
+            errors.append("%s/r%d: matched block lacks exactly one valid run per mode" % (workload, repetition))
+        if repetition > expected_repetitions:
+            errors.append("Unexpected repetition %s/r%d" % (workload, repetition))
+        block_summaries.append({"workload": workload, "repetition": repetition,
+                               "modes": modes, "warmup_seconds": next(iter(warmups)) if len(warmups) == 1 else None})
+    durations = {report.get("measure_seconds", (report["timeline"]["end_monotonic"] -
+                 report["timeline"]["start_monotonic"])) for report in reports}
+    if len(durations) > 1:
+        errors.append("Campaign measurement durations differ")
     return {"schema_version": 1, "directory": str(directory),
             "expected_repetitions": expected_repetitions,
+            "targets_qps": targets, "matched_blocks": block_summaries,
             "aggregation": "Median and min/max of per-run values; no averaging of percentile populations",
             "validation": {"passed": not errors, "errors": errors},
             "groups": groups, "runs": reports}
@@ -569,8 +625,19 @@ def number(value, decimals=2):
 def markdown_report(campaign):
     contracts = sorted(set(report.get("frequency_contract", "locked-clock") for report in campaign["runs"]))
     title = "Redis/YCSB under fixed frequency policy" if contracts == ["fixed-policy"] else "Fixed-frequency Redis/YCSB results"
+    runs = campaign["runs"]
+    workers = sorted(set(report["workers"] for report in runs))
+    targets = "; ".join("%s: %s QPS" % (workload, number(target, 0))
+                         for workload, target in sorted(campaign.get("targets_qps", {}).items()))
+    warmups = sorted(set(report["warmup_seconds"] for report in runs
+                         if report.get("warmup_seconds") is not None))
+    durations = sorted(set(report.get("measure_seconds", report["timeline"]["end_monotonic"] -
+                           report["timeline"]["start_monotonic"]) for report in runs))
+    warmup_text = ", ".join(number(value, 0) for value in warmups) if warmups else "not recorded"
     lines = ["# " + title, "",
-             "Eight workers, a 70,000 QPS aggregate target, 20 seconds excluded, then 600 seconds measured.",
+             "Workers: %s. Aggregate targets by workload: %s. Excluded warmup seconds: %s; measured seconds/run: %s." %
+             (", ".join(map(str, workers)), targets, warmup_text, ", ".join(number(value, 0) for value in durations)),
+             "Warmup is matched across OFF, sampling, and ARM within each workload/repetition block.",
              "Each summary is the median of the valid repetitions; individual runs and ranges remain in the JSON.", "",
              "Validation: **%s**." % ("passed" if campaign["validation"]["passed"] else "incomplete or failed")]
     if contracts == ["fixed-policy"]:
@@ -578,15 +645,16 @@ def markdown_report(campaign):
                   "Bursty runtime effective frequency is reported separately and may differ from the policy target; this result does not claim an exact clock on every active interval."]
     if campaign["validation"]["errors"]:
         lines += ["", "Validation findings:", ""] + ["- " + error for error in campaign["validation"]["errors"]]
-    lines += ["", "| Workload | Mode | Runs | QPS | Shortfall % | Live ARM mean GiB | ARM events | WP events | Scanner flush calls | Redis TLB IPIs |",
-              "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    lines += ["", "| Workload | Mode | Runs | Target QPS | QPS | Shortfall % | Runs below 99% | Live ARM mean GiB | ARM events | WP events | Scanner flush calls | Redis TLB IPIs |",
+              "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for group in campaign["groups"]:
         metric = group["metrics"]
         def med(name):
             return metric.get(name, {}).get("median")
-        lines.append("| %s | %s | %d | %s | %s | %s | %s | %s | %s | %s |" % (
-            group["workload"], group["mode"], len(group["valid_runs"]), number(med("achieved_qps"), 0),
-            number(med("target_shortfall_pct")), number(med("arm_live_gib_mean")),
+        lines.append("| %s | %s | %d | %s | %s | %s | %d | %s | %s | %s | %s | %s |" % (
+            group["workload"], group["mode"], len(group["valid_runs"]),
+            number(campaign.get("targets_qps", {}).get(group["workload"]), 0), number(med("achieved_qps"), 0),
+            number(med("target_shortfall_pct")), len(group.get("throughput_diagnostic", {}).get("below_99_percent_target_runs", [])), number(med("arm_live_gib_mean")),
             number(med("arm_events"), 0), number(med("wp_events"), 0),
             number(med("flush_calls"), 0), number(med("tlb_shootdown_ipis_redis_cpu1"), 0)))
     for stream in ("combined-actual", "combined-intended", "READ", "UPDATE", "Intended-READ", "Intended-UPDATE"):
@@ -603,7 +671,8 @@ def markdown_report(campaign):
               "- ARM events include first ARM and re-ARM; they are not counts of unique pages.",
               "- WP counts are write-terminated ARM generations. Hook timing excludes other page-fault work.",
               "- Scanner flush calls count shared dirty/ARM flushes once. TLB IPIs also include other kernel activity.",
-              "- Intended latency reveals delay against the target schedule when eight workers cannot sustain 70k QPS.",
+              "- Intended latency reveals delay against each workload's target schedule with bounded workers.",
+              "- Runs below 99% of their own target are flagged for throughput shortfall. Meeting the threshold does not prove absence of saturation or queueing.",
               "- Very high percentiles depend on few tail observations, especially workload B updates; inspect per-run sample counts and tail ranks.",
               "- Invalid runs are retained and excluded explicitly; an incomplete campaign is never presented as a complete three-repetition result.", ""]
     return "\n".join(lines)
@@ -658,7 +727,10 @@ def plot_campaign(campaign, directory):
         axis.set_xlabel("Workload")
         axis.set_ylabel(label)
         axis.grid(axis="y", alpha=.2)
-    axes[0].axhline(70, color="#555555", linestyle="--", linewidth=1, label="70k target")
+    targets = campaign.get("targets_qps", {})
+    axes[0].plot(range(len(WORKLOADS)), [targets.get(w) / 1000 if targets.get(w) is not None
+                 else float("nan") for w in WORKLOADS], color="#555555", linestyle="--",
+                 marker="_", markersize=14, linewidth=1, label="Workload target")
     axes[0].legend(frameon=False, fontsize=8)
     figure.suptitle("Throughput, protected memory, and write faults")
     figure.tight_layout(rect=(0, 0, 1, .94))
