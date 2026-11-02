@@ -1,0 +1,37 @@
+{
+  "archived_at": "2026-11-02T15:50:59.907605+00:00",
+  "files": [
+    {
+      "bytes": 1828,
+      "name": "archive-eligibility-evidence-20261101.py",
+      "sha256": "8ddd11c81df18e9c97d0dd7c47341d5bc2df50c627cbb1f3a7ca75bbbe953700",
+      "source": "/home/yans3/cmdp-v2/redis-ycsb-study/archive-eligibility-evidence-20261101.py"
+    },
+    {
+      "bytes": 1784,
+      "name": "archive-eligibility-evidence-v2-20261101.py",
+      "sha256": "cecb352363db1981db056c4d2aca296445f01f935185253620341286aeacc37c",
+      "source": "/home/yans3/cmdp-v2/redis-ycsb-study/archive-eligibility-evidence-v2-20261101.py"
+    },
+    {
+      "bytes": 2469,
+      "name": "collect-eligibility-final-state-20261101.py",
+      "sha256": "2f4eb89126688898b792c2e5153bae81fcf426344680164cd994cb945514f4dd",
+      "source": "/home/yans3/cmdp-v2/redis-ycsb-study/collect-eligibility-final-state-20261101.py"
+    },
+    {
+      "bytes": 2653,
+      "name": "collect-tail-launch-20261102.py",
+      "sha256": "7d6f51fc571f61adaaf299219b4965cb81bec4cc3e3c7d2ae73cd3c1938aa69d",
+      "source": "/home/yans3/cmdp-v2/redis-ycsb-study/collect-tail-launch-20261102.py"
+    },
+    {
+      "bytes": 1951,
+      "name": "validate-tail-20261102.py",
+      "sha256": "f54937bd4919c107f49d790eab9f6236d2f1253743a6f20b7ab5232d6c24126f",
+      "source": "/home/yans3/cmdp-v2/redis-ycsb-study/validate-tail-20261102.py"
+    }
+  ],
+  "purpose": "Exact dated evidence/validation helper snapshots; not live campaign sources",
+  "validation": "Python 3.6 AST parse and byte-for-byte comparison against originals; no scripts executed"
+}
